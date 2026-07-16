@@ -14,7 +14,12 @@ struct bluetooth_result {
     char name[128];
     char mac[32];
     int rssi;
+    char best_seen_name[128];
+    char best_seen_mac[32];
+    int best_seen_rssi;
+    int matched_rssi;
     int error_code;
+    char failure_reason[64];
     char error_message[256];
 };
 

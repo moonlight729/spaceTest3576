@@ -5,16 +5,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/wait.h>
 
 #define LINE_SIZE 512
 
-static void set_error(struct bluetooth_result *result, int code, const char *message)
+static void set_error(struct bluetooth_result *result, int code, const char *message, const char *reason)
 {
     size_t length = strnlen(message, sizeof(result->error_message) - 1);
+    size_t reason_length = strnlen(reason, sizeof(result->failure_reason) - 1);
     result->error_code = code;
     memcpy(result->error_message, message, length);
     result->error_message[length] = '\0';
+    memcpy(result->failure_reason, reason, reason_length);
+    result->failure_reason[reason_length] = '\0';
 }
 
 static int command_exit_status(const char *command)
@@ -46,11 +50,35 @@ static bool parse_device_line(const char *line, char *mac, size_t mac_size,
     return mac[0] != '\0' && name[0] != '\0';
 }
 
+static void update_best_seen(struct bluetooth_result *result, const char *name, const char *mac, int rssi)
+{
+    if (name[0] == '\0' || mac[0] == '\0') return;
+    if (result->best_seen_name[0] == '\0' || rssi > result->best_seen_rssi) {
+        snprintf(result->best_seen_name, sizeof(result->best_seen_name), "%s", name);
+        snprintf(result->best_seen_mac, sizeof(result->best_seen_mac), "%s", mac);
+        result->best_seen_rssi = rssi;
+    }
+}
+
+static bool parse_rssi_line(const char *line, char *mac, size_t mac_size, int *rssi)
+{
+    const char *rssi_text = strstr(line, "RSSI:");
+    const char *device = strstr(line, "Device ");
+    const char *paren;
+    (void)mac_size;
+    if (rssi_text == NULL || device == NULL) return false;
+    device += strlen("Device ");
+    if (sscanf(device, "%31s", mac) != 1) return false;
+    paren = strchr(rssi_text, '(');
+    if (paren != NULL && sscanf(paren, "(%d)", rssi) == 1) return true;
+    if (sscanf(rssi_text, "RSSI: %d", rssi) == 1) return true;
+    return false;
+}
 int bluetoothctl_scan_target(const struct bluetooth_request *request,
                              struct bluetooth_result *result)
 {
     FILE *stream;
-    char command[128], line[LINE_SIZE], candidate_mac[32] = "";
+    char command[128], line[LINE_SIZE];
     bool candidate = false;
     int seconds, status;
 
@@ -58,40 +86,53 @@ int bluetoothctl_scan_target(const struct bluetooth_request *request,
         request->timeout_ms <= 0) { errno = EINVAL; return -1; }
     memset(result, 0, sizeof(*result));
     result->rssi = -127;
+    result->matched_rssi = -127;
+    result->best_seen_rssi = -127;
     if (bluetoothctl_health() != 0) {
-        set_error(result, 4200, "Bluetooth controller is unavailable");
+        set_error(result, 4200, "Bluetooth controller is unavailable", "bluetoothctl_error");
         return -1;
     }
     seconds = (request->timeout_ms + 999) / 1000;
     snprintf(command, sizeof(command), "bluetoothctl --timeout %d scan on 2>&1", seconds);
     stream = popen(command, "r");
-    if (stream == NULL) { set_error(result, 4201, "Unable to start bluetoothctl scan"); return -1; }
+    if (stream == NULL) { set_error(result, 4201, "Unable to start bluetoothctl scan", "bluetoothctl_error"); return -1; }
     while (fgets(line, sizeof(line), stream) != NULL) {
         char mac[32] = "", name[128] = "";
-        char *rssi_text;
         int rssi;
-        if (parse_device_line(line, mac, sizeof(mac), name, sizeof(name)) &&
-            strcmp(name, request->target_name) == 0) {
-            candidate = true;
-            snprintf(candidate_mac, sizeof(candidate_mac), "%s", mac);
-            snprintf(result->name, sizeof(result->name), "%s", name);
-            snprintf(result->mac, sizeof(result->mac), "%s", mac);
+        if (parse_device_line(line, mac, sizeof(mac), name, sizeof(name))) {
+            if (strcmp(name, request->target_name) == 0) {
+                candidate = true;
+                snprintf(result->name, sizeof(result->name), "%s", name);
+                snprintf(result->mac, sizeof(result->mac), "%s", mac);
+            }
         }
-        rssi_text = strstr(line, "RSSI:");
-        if (candidate && rssi_text != NULL && strstr(line, candidate_mac) != NULL &&
-            sscanf(rssi_text, "RSSI: %d", &rssi) == 1) {
-            result->rssi = rssi;
-            if (rssi >= request->min_rssi) result->found = true;
+        if (parse_rssi_line(line, mac, sizeof(mac), &rssi)) {
+            if (candidate && result->mac[0] != '\0' && strcmp(mac, result->mac) == 0) {
+                result->matched_rssi = rssi;
+                result->rssi = rssi;
+                update_best_seen(result, result->name, result->mac, rssi);
+                if (rssi >= request->min_rssi) result->found = true;
+            } else if (result->best_seen_mac[0] != '\0' && strcmp(mac, result->best_seen_mac) == 0) {
+                if (rssi > result->best_seen_rssi) result->best_seen_rssi = rssi;
+            }
+        }
+        if (strstr(line, "Device ") != NULL && strstr(line, "RSSI:") != NULL) {
+            char seen_mac[32] = "", seen_name[128] = "";
+            int seen_rssi;
+            if (parse_device_line(line, seen_mac, sizeof(seen_mac), seen_name, sizeof(seen_name)) &&
+                parse_rssi_line(line, seen_mac, sizeof(seen_mac), &seen_rssi)) {
+                update_best_seen(result, seen_name, seen_mac, seen_rssi);
+            }
         }
     }
     status = pclose(stream);
     if (result->found) return 0;
     if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        set_error(result, 4202, "bluetoothctl scan failed");
+        set_error(result, 4202, "bluetoothctl scan failed", "bluetoothctl_error");
     } else if (candidate) {
-        set_error(result, 4203, "Target found but RSSI is below threshold");
+        set_error(result, 4203, "Target found but RSSI is below threshold", "target_found_but_rssi_low");
     } else {
-        set_error(result, 4204, "Target Bluetooth name was not found");
+        set_error(result, 4204, "Target Bluetooth name was not found", "target_not_found");
     }
     return -1;
 }
