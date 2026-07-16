@@ -8,10 +8,13 @@ APP_OBJECTS = \
 	hardware/fingerprint/fingerprint.o \
 	hardware/bluetooth/bluetoothctl_scan.o \
 	hardware/camera/camera_stream.o \
+	hardware/ethernet/ethernet_nmcli.o \
 	hardware/fast_charge/fast_charge.o \
 	hardware/keys/key_input.o \
 	hardware/wifi/wifi_nmcli.o \
 	hardware/tf_card/tf_card.o \
+	hardware/usb3.0/usb3_file_check.o \
+	hardware/pcba_points/pcba_points_file.o \
 	tests/test_runner.o \
 	manage/session_manager.o \
 	main.o
@@ -33,6 +36,8 @@ hardware/bluetooth/bluetoothctl_scan.o: hardware/bluetooth/bluetoothctl_scan.c h
 	$(CC) $(CFLAGS) -c hardware/bluetooth/bluetoothctl_scan.c -o $@
 hardware/camera/camera_stream.o: hardware/camera/camera_stream.c hardware/camera/camera_stream.h
 	$(CC) $(CFLAGS) -c hardware/camera/camera_stream.c -o $@
+hardware/ethernet/ethernet_nmcli.o: hardware/ethernet/ethernet_nmcli.c hardware/ethernet/ethernet_nmcli.h
+	$(CC) $(CFLAGS) -c hardware/ethernet/ethernet_nmcli.c -o $@
 hardware/fast_charge/fast_charge.o: hardware/fast_charge/fast_charge.c hardware/fast_charge/fast_charge.h
 	$(CC) $(CFLAGS) -c hardware/fast_charge/fast_charge.c -o $@
 hardware/keys/key_input.o: hardware/keys/key_input.c hardware/keys/key_input.h
@@ -41,7 +46,11 @@ hardware/wifi/wifi_nmcli.o: hardware/wifi/wifi_nmcli.c hardware/wifi/wifi_nmcli.
 	$(CC) $(CFLAGS) -c hardware/wifi/wifi_nmcli.c -o $@
 hardware/tf_card/tf_card.o: hardware/tf_card/tf_card.c hardware/tf_card/tf_card.h
 	$(CC) $(CFLAGS) -c hardware/tf_card/tf_card.c -o $@
-tests/test_runner.o: tests/test_runner.c tests/test_runner.h protocol/protocol.h storage/board_state.h hardware/fingerprint/fingerprint.h hardware/bluetooth/bluetoothctl_scan.h hardware/camera/camera_stream.h hardware/fast_charge/fast_charge.h hardware/keys/key_input.h hardware/wifi/wifi_nmcli.h hardware/tf_card/tf_card.h
+hardware/usb3.0/usb3_file_check.o: hardware/usb3.0/usb3_file_check.c hardware/usb3.0/usb3_file_check.h
+	$(CC) $(CFLAGS) -c hardware/usb3.0/usb3_file_check.c -o $@
+hardware/pcba_points/pcba_points_file.o: hardware/pcba_points/pcba_points_file.c hardware/pcba_points/pcba_points_file.h
+	$(CC) $(CFLAGS) -c hardware/pcba_points/pcba_points_file.c -o $@
+tests/test_runner.o: tests/test_runner.c tests/test_runner.h protocol/protocol.h storage/board_state.h hardware/fingerprint/fingerprint.h hardware/bluetooth/bluetoothctl_scan.h hardware/camera/camera_stream.h hardware/ethernet/ethernet_nmcli.h hardware/fast_charge/fast_charge.h hardware/keys/key_input.h hardware/wifi/wifi_nmcli.h hardware/tf_card/tf_card.h hardware/usb3.0/usb3_file_check.h hardware/pcba_points/pcba_points_file.h
 	$(CC) $(CFLAGS) -c tests/test_runner.c -o $@
 manage/session_manager.o: manage/session_manager.c manage/session_manager.h protocol/protocol.h storage/board_state.h tests/test_runner.h
 	$(CC) $(CFLAGS) -c manage/session_manager.c -o $@

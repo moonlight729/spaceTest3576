@@ -4,9 +4,12 @@
 #include "../hardware/fingerprint/fingerprint.h"
 #include "../hardware/bluetooth/bluetoothctl_scan.h"
 #include "../hardware/camera/camera_stream.h"
+#include "../hardware/ethernet/ethernet_nmcli.h"
 #include "../hardware/fast_charge/fast_charge.h"
 #include "../hardware/keys/key_input.h"
 #include "../hardware/tf_card/tf_card.h"
+#include "../hardware/usb3.0/usb3_file_check.h"
+#include "../hardware/pcba_points/pcba_points_file.h"
 #include "../hardware/wifi/wifi_nmcli.h"
 #include "../protocol/protocol.h"
 #include "../storage/board_state.h"
@@ -153,7 +156,7 @@ static int param_bool(const char *start, const char *end, const char *key, int f
 static int send_report(int fd, const char *test_id, const char *status,
                        int code, const char *message, const char *data_json)
 {
-    char line[1024];
+    char line[16384];
     protocol_build_test_report(line, sizeof(line), test_id, status, code, message, data_json);
     return protocol_write_line(fd, line);
 }
@@ -217,6 +220,67 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     return send_report(fd, "wifi", "passed", 0, "Wi-Fi test passed", data);
 }
 
+static int run_ethernet(int fd, const char *test_start, const char *test_end)
+{
+    char interface_name[64] = "end0";
+    char router_ip[64] = "192.168.110.1";
+    struct ethernet_request request = {
+        .interface_name = interface_name,
+        .router_ip = router_ip,
+        .ping_count = 4,
+        .timeout_ms = 15000,
+        .wait_cable_unplug = true,
+        .unplug_timeout_ms = 10000,
+    };
+    struct ethernet_result result;
+    char data[768];
+
+    param_string(test_start, test_end, "interfaceName", interface_name, sizeof(interface_name));
+    param_string(test_start, test_end, "routerIp", router_ip, sizeof(router_ip));
+    request.ping_count = param_int(test_start, test_end, "pingCount", request.ping_count);
+    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+    request.wait_cable_unplug = param_bool(test_start, test_end, "waitCableUnplug", request.wait_cable_unplug);
+    request.unplug_timeout_ms = param_int(test_start, test_end, "unplugTimeoutMs", request.unplug_timeout_ms);
+
+    snprintf(data, sizeof(data),
+             "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"wifiDisabled\":true}",
+             interface_name, router_ip);
+    send_report(fd, "ethernet", "running", 0, "Insert Ethernet cable", data);
+
+    if (ethernet_nmcli_run_test(&request, &result) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"wifiDisabled\":%s,\"linkUp\":%s,\"ipAcquired\":%s,\"pingOk\":%s,\"ip\":\"%s\"}",
+                 result.interface_name, result.router_ip,
+                 result.wifi_disabled ? "true" : "false",
+                 result.link_up ? "true" : "false",
+                 result.ip_acquired ? "true" : "false",
+                 result.ping_ok ? "true" : "false",
+                 result.ip);
+        send_report(fd, "ethernet", "failed",
+                    result.error_code == 0 ? 4800 : result.error_code,
+                    result.message[0] == '\0' ? "Ethernet test failed" : result.message,
+                    data);
+        return -1;
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,\"pingOk\":true}",
+             result.interface_name, result.ip, result.router_ip,
+             result.completed_ping_count, result.avg_delay_ms);
+    send_report(fd, "ethernet", "running", 0, "Remove Ethernet cable", data);
+    if (request.wait_cable_unplug) {
+        result.cable_unplugged = ethernet_nmcli_wait_cable_unplug(interface_name, request.unplug_timeout_ms) == 0;
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,\"wifiDisabled\":%s,\"cableUnplugged\":%s}",
+             result.interface_name, result.ip, result.router_ip,
+             result.completed_ping_count, result.avg_delay_ms,
+             result.wifi_disabled ? "true" : "false",
+             result.cable_unplugged ? "true" : "false");
+    return send_report(fd, "ethernet", "passed", 0, result.message, data);
+}
+
 static int run_tf_card(int fd, const struct app_config *config, const char *test_start, const char *test_end)
 {
     char device_path[128];
@@ -251,6 +315,117 @@ static int run_tf_card(int fd, const struct app_config *config, const char *test
              (unsigned long long)result.free_mb,
              result.rw_passed ? "true" : "false");
     return send_report(fd, "tf", "passed", 0, result.message, data);
+}
+
+static int run_usb2_3(int fd, const char *test_start, const char *test_end)
+{
+    char record_file[160] = "/tmp/spacetest_usb_ports.json";
+    struct usb_ports_request request = {
+        .record_file = record_file,
+        .expected_usb2_count = 2,
+        .expected_usb3_count = 2,
+        .timeout_ms = 3000,
+    };
+    struct usb_ports_result result;
+    char data[768];
+
+    param_string(test_start, test_end, "recordFile", record_file, sizeof(record_file));
+    request.expected_usb2_count = param_int(test_start, test_end, "expectedUsb2Count", request.expected_usb2_count);
+    request.expected_usb3_count = param_int(test_start, test_end, "expectedUsb3Count", request.expected_usb3_count);
+    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+
+    snprintf(data, sizeof(data),
+             "{\"recordFile\":\"%s\",\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
+             record_file, request.expected_usb2_count, request.expected_usb3_count);
+    send_report(fd, "usb2_3", "running", 0, "Read USB2.0&3.0 summary file", data);
+
+    if (usb_ports_run_test(&request, &result) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"recordFile\":\"%s\",\"usb2Count\":%d,\"usb3Count\":%d,\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
+                 result.record_file, result.usb2_count, result.usb3_count,
+                 result.expected_usb2_count, result.expected_usb3_count);
+        send_report(fd, "usb2_3", "failed",
+                    result.error_code == 0 ? 4900 : result.error_code,
+                    result.message[0] == '\0' ? "USB2.0&3.0 record check failed" : result.message,
+                    data);
+        return -1;
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"recordFile\":\"%s\",\"usb2Count\":%d,\"usb3Count\":%d,\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
+             result.record_file, result.usb2_count, result.usb3_count,
+             result.expected_usb2_count, result.expected_usb3_count);
+    return send_report(fd, "usb2_3", "passed", 0, result.message, data);
+}
+
+static void append_pcba_points_json(char *data, size_t data_size,
+                                    const struct pcba_points_result *result,
+                                    int include_all_points)
+{
+    size_t used;
+    int i;
+    snprintf(data, data_size,
+             "{\"recordFile\":\"%s\",\"channelCount\":%d,\"parsedCount\":%d,\"passedCount\":%d,\"failedCount\":%d,\"failedPoints\":[",
+             result->record_file, result->channel_count, result->parsed_count,
+             result->passed_count, result->failed_count);
+    used = strnlen(data, data_size);
+    for (i = 0; i < result->parsed_count && i < 32; ++i) {
+        if (!result->points[i].passed) {
+            snprintf(data + used, data_size - used, "%s%d", used > 0 && data[used - 1] != '[' ? "," : "", result->points[i].index);
+            used = strnlen(data, data_size);
+        }
+    }
+    snprintf(data + used, data_size - used, "],\"points\":[");
+    used = strnlen(data, data_size);
+    if (include_all_points) {
+        for (i = 0; i < result->parsed_count && i < 32; ++i) {
+            snprintf(data + used, data_size - used,
+                     "%s{\"index\":%d,\"name\":\"TP%02d\",\"voltageMv\":%d,\"minMv\":%d,\"maxMv\":%d,\"passed\":%s}",
+                     i == 0 ? "" : ",",
+                     result->points[i].index, result->points[i].index,
+                     result->points[i].voltage_mv, result->points[i].min_mv,
+                     result->points[i].max_mv, result->points[i].passed ? "true" : "false");
+            used = strnlen(data, data_size);
+        }
+    }
+    snprintf(data + used, data_size - used, "]}");
+}
+
+static int run_pcba_test_points(int fd, const char *test_start, const char *test_end)
+{
+    char record_file[160] = "/tmp/spacetest_pcba_points.json";
+    struct pcba_points_request request = {
+        .record_file = record_file,
+        .channel_count = 32,
+        .default_min_mv = 0,
+        .default_max_mv = 5000,
+        .timeout_ms = 5000
+    };
+    struct pcba_points_result result;
+    char data[8192];
+
+    param_string(test_start, test_end, "recordFile", record_file, sizeof(record_file));
+    request.channel_count = param_int(test_start, test_end, "channelCount", request.channel_count);
+    request.default_min_mv = param_int(test_start, test_end, "defaultMinMv", request.default_min_mv);
+    request.default_max_mv = param_int(test_start, test_end, "defaultMaxMv", request.default_max_mv);
+    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+
+    snprintf(data, sizeof(data),
+             "{\"recordFile\":\"%s\",\"channelCount\":%d,\"defaultMinMv\":%d,\"defaultMaxMv\":%d}",
+             record_file, request.channel_count, request.default_min_mv, request.default_max_mv);
+    send_report(fd, "pcba_test_points", "running", 0, "Read PCBA test point voltages", data);
+
+    if (pcba_points_run_test(&request, &result) != 0) {
+        append_pcba_points_json(data, sizeof(data), &result, 1);
+        send_report(fd, "pcba_test_points", "failed",
+                    result.error_code == 0 ? 5000 : result.error_code,
+                    result.message[0] == '\0' ? "PCBA test point check failed" : result.message,
+                    data);
+        return -1;
+    }
+
+    append_pcba_points_json(data, sizeof(data), &result, 1);
+    return send_report(fd, "pcba_test_points", "passed", 0, result.message, data);
 }
 
 static int run_bluetooth(int fd, const struct app_config *config, const char *test_start, const char *test_end)
@@ -547,6 +722,18 @@ static int run_unsupported_test(int fd, const char *test_id)
     return -1;
 }
 
+static int run_skipped_test(int fd, const char *test_id, const char *test_start, const char *test_end)
+{
+    char reason[160];
+    char data[512];
+    snprintf(reason, sizeof(reason), "Skipped by host policy");
+    param_string(test_start, test_end, "skipReason", reason, sizeof(reason));
+    snprintf(data, sizeof(data),
+             "{\"skipReason\":\"%s\",\"countInFinalVerdict\":false}",
+             reason);
+    return send_report(fd, test_id, "skipped", 2900, reason, data);
+}
+
 static int run_one_test(int fd, const char *test_id, const struct app_config *config,
                         const char *test_start, const char *test_end)
 {
@@ -554,8 +741,11 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     if (strcmp(test_id, "hdmi") == 0) return run_manual_observation(fd, "hdmi", "HDMI", test_start, test_end);
     if (strcmp(test_id, "lcd") == 0) return run_manual_observation(fd, "lcd", "LCD", test_start, test_end);
     if (strcmp(test_id, "fingerprint") == 0) return run_fingerprint(fd);
+    if (strcmp(test_id, "ethernet") == 0) return run_ethernet(fd, test_start, test_end);
     if (strcmp(test_id, "wifi") == 0) return run_wifi(fd, config, test_start, test_end);
     if (strcmp(test_id, "tf") == 0) return run_tf_card(fd, config, test_start, test_end);
+    if (strcmp(test_id, "usb2_3") == 0) return run_usb2_3(fd, test_start, test_end);
+    if (strcmp(test_id, "pcba_test_points") == 0) return run_pcba_test_points(fd, test_start, test_end);
     if (strcmp(test_id, "bluetooth") == 0) return run_bluetooth(fd, config, test_start, test_end);
     if (strcmp(test_id, "typec_fast_charge") == 0 || strcmp(test_id, "fast_charge") == 0) {
         return run_fast_charge(fd, config, test_start, test_end);
@@ -571,8 +761,11 @@ static int failure_code_for_test(const char *test_id)
 {
     if (strcmp(test_id, "board_state") == 0) return 3001;
     if (strcmp(test_id, "fingerprint") == 0) return 3002;
+    if (strcmp(test_id, "ethernet") == 0) return 3011;
     if (strcmp(test_id, "wifi") == 0) return 3003;
     if (strcmp(test_id, "tf") == 0) return 3004;
+    if (strcmp(test_id, "usb2_3") == 0) return 3012;
+    if (strcmp(test_id, "pcba_test_points") == 0) return 3013;
     if (strcmp(test_id, "bluetooth") == 0) return 3005;
     if (strcmp(test_id, "typec_fast_charge") == 0 || strcmp(test_id, "fast_charge") == 0) return 3006;
     if (strcmp(test_id, "hdmi") == 0) return 3009;
@@ -587,6 +780,7 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
 {
     int executed = 0;
     int failed_count = 0;
+    int skipped_count = 0;
     int first_failed_code = 0;
     char first_failed_test[80] = "";
     const char *cursor = request_json;
@@ -596,6 +790,11 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
 
     while (read_next_test(&cursor, test_id, sizeof(test_id), &test_start, &test_end)) {
         executed++;
+        if (param_bool(test_start, test_end, "skip", 0)) {
+            run_skipped_test(fd, test_id, test_start, test_end);
+            skipped_count++;
+            continue;
+        }
         if (run_one_test(fd, test_id, config, test_start, test_end) != 0) {
             remember_failure(&failed_count, &first_failed_code,
                              first_failed_test, sizeof(first_failed_test),
@@ -613,9 +812,14 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
 
     if (failed_count > 0) {
         char message[160];
-        snprintf(message, sizeof(message), "Session completed with %d failed test(s), first failed: %s",
-                 failed_count, first_failed_test);
+        snprintf(message, sizeof(message), "Session completed with %d failed test(s), %d skipped, first failed: %s",
+                 failed_count, skipped_count, first_failed_test);
         return send_completed(fd, session_id, "failed", first_failed_code, message);
+    }
+    if (skipped_count > 0) {
+        char message[160];
+        snprintf(message, sizeof(message), "Session completed with %d skipped test(s)", skipped_count);
+        return send_completed(fd, session_id, "passed", 0, message);
     }
     return send_completed(fd, session_id, "passed", 0, "Session completed");
 }

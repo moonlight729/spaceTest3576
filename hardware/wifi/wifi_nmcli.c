@@ -80,12 +80,17 @@ int wifi_nmcli_connect(struct wifi_device *device, const struct wifi_request *re
                        struct wifi_result *result)
 {
     char output[WIFI_CMD_OUTPUT], wait_seconds[16];
+    char *radio_argv[] = { "nmcli", "radio", "wifi", "on", NULL };
     char *argv[] = { "nmcli", "--wait", wait_seconds, "device", "wifi", "connect",
                      (char *)request->ssid, "password", (char *)request->password,
                      "ifname", device->interface_name, NULL };
     int rc;
     if (device == NULL || request == NULL || result == NULL || request->ssid == NULL ||
         device->interface_name[0] == '\0') { errno = EINVAL; return -1; }
+    if (run_command(radio_argv, output, sizeof(output)) != 0) {
+        set_error(result, 4104, output[0] ? output : "failed to enable Wi-Fi radio");
+        return -1;
+    }
     if (request->reuse_current_connection) {
         char active_ssid[256];
         if (wifi_nmcli_get_active_ssid(device, active_ssid, sizeof(active_ssid)) != 0 ||
@@ -134,12 +139,14 @@ int wifi_nmcli_get_ipv4(const struct wifi_device *device, char *ip, size_t ip_si
     return 0;
 }
 
-int wifi_nmcli_ping_gateway(const struct wifi_request *request, struct wifi_result *result)
+int wifi_nmcli_ping_gateway(const struct wifi_device *device, const struct wifi_request *request,
+                            struct wifi_result *result)
 {
     char output[WIFI_CMD_OUTPUT], count[16], timeout[16], *avg;
-    char *argv[] = { "ping", "-n", "-c", count, "-W", timeout, (char *)request->router_ip, NULL };
+    char *argv[] = { "ping", "-I", (char *)device->interface_name, "-n", "-c", count, "-W", timeout, (char *)request->router_ip, NULL };
     int rc;
-    if (request == NULL || result == NULL || request->router_ip == NULL) { errno = EINVAL; return -1; }
+    if (device == NULL || request == NULL || result == NULL || request->router_ip == NULL ||
+        device->interface_name[0] == '\0') { errno = EINVAL; return -1; }
     snprintf(count, sizeof(count), "%d", request->ping_count);
     snprintf(timeout, sizeof(timeout), "%d", (request->timeout_ms + 999) / 1000);
     rc = run_command(argv, output, sizeof(output));
@@ -164,5 +171,5 @@ int wifi_nmcli_run_test(struct wifi_device *device, const struct wifi_request *r
         set_error(result, 4102, "DHCP did not provide an IPv4 address");
         return -1;
     }
-    return wifi_nmcli_ping_gateway(request, result);
+    return wifi_nmcli_ping_gateway(device, request, result);
 }

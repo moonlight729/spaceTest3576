@@ -101,3 +101,15 @@
 4. 接入 `indicator_led` 和 `fan` 的 `test.control` / `test.decision` 闭环。
 5. 实现 `sys.write_sn` 与本地摘要存储。
 6. HDMI/LCD 人工判定接入 `operator.decision`。
+## 2026-07-16 Checklist Update
+
+- [x] Host/3576 skip protocol: `status=skipped`, `resultCode=2900`, excluded from final verdict.
+- [x] Ethernet protocol: host item `ethernet`, 3576 disables Wi-Fi, checks carrier/IP/ping, prompts cable unplug.
+- [x] USB2.0&3.0 protocol: host item `usb2_3`, 3576 reads `/tmp/spacetest_usb_ports.json`.
+- [x] USB2.0&3.0 default policy: default skip until board file producer is ready.
+- [x] PCBA test points protocol: host item `pcba_test_points`, 32 channel voltage result contract defined.
+- [x] PCBA test points 3576 framework: reads `/tmp/spacetest_pcba_points.json`, returns per-channel voltage and pass/fail.
+- [x] PCBA test points default policy: default skip until acquisition hardware/file producer is ready.
+- [ ] PCBA test points real acquisition backend: replace summary-file reader with ADC / fixture interface.
+- [ ] USB2.0&3.0 real summary producer: board side generates USB2.0/USB3.0 plug history file.
+- [ ] Ethernet real production validation: run through UI/ADB with wired network connected; avoid running over SSH Wi-Fi path.

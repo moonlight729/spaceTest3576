@@ -108,3 +108,21 @@ spaceTest3576/
 4. HDMI/LCD 人工判定和 LED/风扇控制回路。
 5. 板快充/板放电与上位机自动判定回路。
 6. 硬件实机联调、异常恢复、板端摘要持久化。
+## 2026-07-16 Protocol Update
+
+The current 3576 service supports a host-driven test plan with optional `skip`.
+
+- `skip=true` returns `test.report/status=skipped`, `resultCode=2900`.
+- Skipped items are recorded but are not counted in the final verdict.
+
+New / updated modules:
+
+- `hardware/ethernet`: uses `nmcli`, disables Wi-Fi first, waits Ethernet link/IP, pings with `-I <interfaceName>`, optionally waits for cable unplug.
+- `hardware/usb3.0`: `usb2_3` reads `/tmp/spacetest_usb_ports.json` and validates `usb2Count` / `usb3Count`; default host config skips it until the board file producer is ready.
+- `hardware/pcba_points`: `pcba_test_points` reads `/tmp/spacetest_pcba_points.json`, validates up to 32 `voltageMv` values against host-provided default limits, and returns per-channel results; default host config skips it until the acquisition interface is ready.
+
+Recommended order:
+
+`board_state -> hdmi -> keys -> lcd -> ethernet -> wifi -> bluetooth -> fingerprint -> typec_fast_charge -> typec_camera -> tf -> usb2_3 -> pcba_test_points -> indicator_led -> fan -> battery_management`
+
+`ethernet` must stay before `wifi` because Ethernet test disables Wi-Fi and Wi-Fi test re-enables it.

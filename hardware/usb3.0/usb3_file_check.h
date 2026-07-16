@@ -38,6 +38,23 @@ struct usb3_result {
     char message[160];
 };
 
+struct usb_ports_request {
+    const char *record_file;
+    int expected_usb2_count;
+    int expected_usb3_count;
+    int timeout_ms;
+};
+
+struct usb_ports_result {
+    char record_file[160];
+    int usb2_count;
+    int usb3_count;
+    int expected_usb2_count;
+    int expected_usb3_count;
+    int error_code;
+    char message[160];
+};
+
 int usb3_open(struct usb3_device *device);
 void usb3_close(struct usb3_device *device);
 int usb3_configure_paths(struct usb3_device *device,
@@ -48,5 +65,7 @@ int usb3_read(struct usb3_device *device, struct usb3_result *result);
 int usb3_run_test(struct usb3_device *device,
                   const struct usb3_request *request,
                   struct usb3_result *result);
+int usb_ports_run_test(const struct usb_ports_request *request,
+                       struct usb_ports_result *result);
 
 #endif

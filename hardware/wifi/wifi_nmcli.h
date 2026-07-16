@@ -34,7 +34,8 @@ int wifi_nmcli_connect(struct wifi_device *device, const struct wifi_request *re
                        struct wifi_result *result);
 int wifi_nmcli_get_active_ssid(const struct wifi_device *device, char *ssid, size_t ssid_size);
 int wifi_nmcli_get_ipv4(const struct wifi_device *device, char *ip, size_t ip_size);
-int wifi_nmcli_ping_gateway(const struct wifi_request *request, struct wifi_result *result);
+int wifi_nmcli_ping_gateway(const struct wifi_device *device, const struct wifi_request *request,
+                            struct wifi_result *result);
 int wifi_nmcli_run_test(struct wifi_device *device, const struct wifi_request *request,
                         struct wifi_result *result);
 

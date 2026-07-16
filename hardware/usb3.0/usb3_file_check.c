@@ -4,8 +4,18 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static void set_message(struct usb3_result *result, int code, const char *message)
+{
+    size_t length;
+    result->error_code = code;
+    length = strnlen(message, sizeof(result->message) - 1);
+    memcpy(result->message, message, length);
+    result->message[length] = '\0';
+}
+
+static void set_ports_message(struct usb_ports_result *result, int code, const char *message)
 {
     size_t length;
     result->error_code = code;
@@ -30,6 +40,44 @@ static int read_int_file(const char *path, int *value)
     }
     fclose(file);
     return 0;
+}
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+static int read_text_file(const char *path, char *buffer, size_t buffer_size)
+{
+    FILE *file;
+    size_t used;
+    if (path == NULL || buffer == NULL || buffer_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    file = fopen(path, "r");
+    if (file == NULL) return -1;
+    used = fread(buffer, 1, buffer_size - 1, file);
+    buffer[used] = '\0';
+    fclose(file);
+    return used == 0 ? -1 : 0;
+}
+
+static int parse_json_int(const char *json, const char *key, int *value)
+{
+    char pattern[80];
+    const char *found;
+    const char *colon;
+    if (json == NULL || key == NULL || value == NULL) return -1;
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    found = strstr(json, pattern);
+    if (found == NULL) return -1;
+    colon = strchr(found + strlen(pattern), ':');
+    if (colon == NULL) return -1;
+    return sscanf(colon + 1, "%d", value) == 1 ? 0 : -1;
 }
 
 int usb3_open(struct usb3_device *device)
@@ -131,5 +179,46 @@ int usb3_run_test(struct usb3_device *device,
         return -1;
     }
     set_message(result, 0, "USB3 check passed");
+    return 0;
+}
+
+int usb_ports_run_test(const struct usb_ports_request *request,
+                       struct usb_ports_result *result)
+{
+    char content[4096];
+    int elapsed = 0;
+
+    if (request == NULL || result == NULL || request->record_file == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(result, 0, sizeof(*result));
+    snprintf(result->record_file, sizeof(result->record_file), "%s", request->record_file);
+    result->expected_usb2_count = request->expected_usb2_count;
+    result->expected_usb3_count = request->expected_usb3_count;
+
+    while (read_text_file(request->record_file, content, sizeof(content)) != 0) {
+        if (elapsed >= request->timeout_ms) {
+            set_ports_message(result, 4901, "USB2.0&3.0 record file not found");
+            return -1;
+        }
+        sleep_ms(200);
+        elapsed += 200;
+    }
+
+    if (parse_json_int(content, "usb2Count", &result->usb2_count) != 0 ||
+        parse_json_int(content, "usb3Count", &result->usb3_count) != 0) {
+        set_ports_message(result, 4900, "USB2.0&3.0 record file is invalid");
+        return -1;
+    }
+    if (result->usb2_count < request->expected_usb2_count) {
+        set_ports_message(result, 4902, "USB2.0 device count is not enough");
+        return -1;
+    }
+    if (result->usb3_count < request->expected_usb3_count) {
+        set_ports_message(result, 4903, "USB3.0 device count is not enough");
+        return -1;
+    }
+    set_ports_message(result, 0, "USB2.0&3.0 record loaded");
     return 0;
 }
