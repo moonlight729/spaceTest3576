@@ -23,6 +23,8 @@
 
 #define CHARGE_CONTROL_ENABLE_COMMAND "i2ctransfer -f -y 7 w2@0x6b 0x12 0x00"
 #define CHARGE_CONTROL_DISABLE_COMMAND "i2ctransfer -f -y 7 w2@0x6b 0x12 0x80"
+#define PMIC_STATUS0_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1b r1"
+#define PMIC_STATUS1_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1c r1"
 
 static int wait_test_decision(int fd, const char *test_id, int timeout_ms, int *passed);
 
@@ -177,6 +179,14 @@ static int net_carrier_is_up(const char *interface_name)
     return value == 1;
 }
 
+static void sleep_ms_local(int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
 static int send_report(int fd, const char *test_id, const char *status,
                        int code, const char *message, const char *data_json)
 {
@@ -188,6 +198,80 @@ static int send_report(int fd, const char *test_id, const char *status,
 static int set_charge_enabled(int enabled)
 {
     return system(enabled ? CHARGE_CONTROL_ENABLE_COMMAND : CHARGE_CONTROL_DISABLE_COMMAND);
+}
+
+static int read_i2c_register_value(const char *command, int *value)
+{
+    FILE *pipe;
+    char buffer[64];
+    unsigned int parsed;
+    if (value == NULL) return -1;
+    *value = 0;
+    pipe = popen(command, "r");
+    if (pipe == NULL) return -1;
+    if (fgets(buffer, sizeof(buffer), pipe) == NULL) {
+        pclose(pipe);
+        return -1;
+    }
+    pclose(pipe);
+    if (sscanf(buffer, "0x%x", &parsed) != 1) return -1;
+    *value = (int)(parsed & 0xFFu);
+    return 0;
+}
+
+static int read_charge_status_bits(int *status0, int *status1,
+                                   int *vbus_present, int *pg_stat, int *chg_stat,
+                                   int *vbus_stat, int *bc12_done)
+{
+    int reg1b;
+    int reg1c;
+    if (read_i2c_register_value(PMIC_STATUS0_READ_COMMAND, &reg1b) != 0 ||
+        read_i2c_register_value(PMIC_STATUS1_READ_COMMAND, &reg1c) != 0) {
+        return -1;
+    }
+    if (status0 != NULL) *status0 = reg1b;
+    if (status1 != NULL) *status1 = reg1c;
+    if (vbus_present != NULL) *vbus_present = reg1b & 0x01;
+    if (pg_stat != NULL) *pg_stat = (reg1b >> 3) & 0x01;
+    if (chg_stat != NULL) *chg_stat = (reg1c >> 5) & 0x07;
+    if (vbus_stat != NULL) *vbus_stat = (reg1c >> 1) & 0x0F;
+    if (bc12_done != NULL) *bc12_done = reg1c & 0x01;
+    return 0;
+}
+
+static const char *map_charge_stage_name(int chg_stat)
+{
+    switch (chg_stat) {
+    case 1: return "trickle";
+    case 2: return "precharge";
+    case 3: return "cc";
+    case 4: return "cv";
+    case 6: return "topoff";
+    case 7: return "done";
+    default: return "not_charging";
+    }
+}
+
+static const char *map_vbus_type_name(int vbus_stat)
+{
+    switch (vbus_stat) {
+    case 0x0: return "no_input";
+    case 0x1: return "usb_sdp";
+    case 0x2: return "usb_cdp";
+    case 0x3: return "usb_dcp";
+    case 0x4: return "hvdcp";
+    case 0x5: return "unknown_adapter";
+    case 0x6: return "non_standard_adapter";
+    case 0x7: return "otg_mode";
+    case 0x8: return "not_qualified_adapter";
+    case 0xB: return "powered_from_vbus";
+    default: return "reserved";
+    }
+}
+
+static int is_external_charger_type(int vbus_stat)
+{
+    return vbus_stat == 0x3 || vbus_stat == 0x4 || vbus_stat == 0x5 || vbus_stat == 0x6;
 }
 
 static int run_board_state(int fd)
@@ -287,6 +371,8 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
 {
     char interface_name[64] = "end0";
     char router_ip[64] = "192.168.110.1";
+    int wait_cable_timeout_ms = 30000;
+    int progress_report_interval_ms = 1000;
     struct ethernet_request request = {
         .interface_name = interface_name,
         .router_ip = router_ip,
@@ -304,21 +390,55 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
     request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
     request.wait_cable_unplug = param_bool(test_start, test_end, "waitCableUnplug", request.wait_cable_unplug);
     request.unplug_timeout_ms = param_int(test_start, test_end, "unplugTimeoutMs", request.unplug_timeout_ms);
+    wait_cable_timeout_ms = param_int(test_start, test_end, "waitCableTimeoutMs", wait_cable_timeout_ms);
+    progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
 
     snprintf(data, sizeof(data),
-             "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"wifiDisabled\":true}",
-             interface_name, router_ip);
+             "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"phase\":\"wait_cable\",\"wifiDisabled\":true,"
+             "\"ethernetLinkUp\":false,\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":0}",
+             interface_name, router_ip, wait_cable_timeout_ms);
     send_report(fd, "ethernet", "running", 0, "Insert Ethernet cable", data);
+
+    if (!net_carrier_is_up(interface_name)) {
+        int elapsed_ms = 0;
+        while (elapsed_ms < wait_cable_timeout_ms && !net_carrier_is_up(interface_name)) {
+            sleep_ms_local(progress_report_interval_ms);
+            elapsed_ms += progress_report_interval_ms;
+            snprintf(data, sizeof(data),
+                     "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"phase\":\"wait_cable\",\"wifiDisabled\":true,"
+                     "\"ethernetLinkUp\":false,\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":%d}",
+                     interface_name, router_ip, wait_cable_timeout_ms, elapsed_ms);
+            send_report(fd, "ethernet", "running", 0, "Waiting for Ethernet cable", data);
+        }
+    }
+
+    if (!net_carrier_is_up(interface_name)) {
+        snprintf(data, sizeof(data),
+                 "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"phase\":\"wait_cable\",\"wifiDisabled\":true,"
+                 "\"ethernetLinkUp\":false,\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"failureReason\":\"ethernet_insert_timeout\"}",
+                 interface_name, router_ip, wait_cable_timeout_ms);
+        send_report(fd, "ethernet", "failed", 4801, "Ethernet cable insert timeout", data);
+        return -1;
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"phase\":\"link_up\",\"wifiDisabled\":true,"
+             "\"ethernetLinkUp\":true,\"requiresCableInsert\":false}",
+             interface_name, router_ip);
+    send_report(fd, "ethernet", "running", 0, "Ethernet cable detected", data);
 
     if (ethernet_nmcli_run_test(&request, &result) != 0) {
         snprintf(data, sizeof(data),
-                 "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"wifiDisabled\":%s,\"linkUp\":%s,\"ipAcquired\":%s,\"pingOk\":%s,\"ip\":\"%s\"}",
+                 "{\"interfaceName\":\"%s\",\"routerIp\":\"%s\",\"phase\":\"failed\",\"wifiDisabled\":%s,"
+                 "\"ethernetLinkUp\":%s,\"ipAcquired\":%s,\"pingOk\":%s,\"ip\":\"%s\",\"failureReason\":\"%s\"}",
                  result.interface_name, result.router_ip,
                  result.wifi_disabled ? "true" : "false",
                  result.link_up ? "true" : "false",
                  result.ip_acquired ? "true" : "false",
                  result.ping_ok ? "true" : "false",
-                 result.ip);
+                 result.ip,
+                 result.failure_reason);
         send_report(fd, "ethernet", "failed",
                     result.error_code == 0 ? 4800 : result.error_code,
                     result.message[0] == '\0' ? "Ethernet test failed" : result.message,
@@ -327,7 +447,8 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
     }
 
     snprintf(data, sizeof(data),
-             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,\"pingOk\":true}",
+             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,"
+             "\"pingOk\":true,\"phase\":\"ping_ok\",\"ethernetLinkUp\":true}",
              result.interface_name, result.ip, result.router_ip,
              result.completed_ping_count, result.avg_delay_ms);
     send_report(fd, "ethernet", "running", 0, "Remove Ethernet cable", data);
@@ -336,11 +457,13 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
     }
 
     snprintf(data, sizeof(data),
-             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,\"wifiDisabled\":%s,\"cableUnplugged\":%s}",
+             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,"
+             "\"wifiDisabled\":%s,\"cableUnplugged\":%s,\"phase\":\"completed\",\"ethernetLinkUp\":%s}",
              result.interface_name, result.ip, result.router_ip,
              result.completed_ping_count, result.avg_delay_ms,
              result.wifi_disabled ? "true" : "false",
-             result.cable_unplugged ? "true" : "false");
+             result.cable_unplugged ? "true" : "false",
+             result.link_up ? "true" : "false");
     return send_report(fd, "ethernet", "passed", 0, result.message, data);
 }
 
@@ -556,6 +679,16 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     };
     struct fast_charge_result result;
     char data[512];
+    int wait_charger_timeout_ms = 30000;
+    int progress_report_interval_ms = 1000;
+    int elapsed_ms = 0;
+    int pmic_status0 = 0;
+    int pmic_status1 = 0;
+    int vbus_present = 0;
+    int pg_stat = 0;
+    int chg_stat = 0;
+    int vbus_stat = 0;
+    int bc12_done = 0;
     int passed = 0;
 
     request.voltage_min_mv = param_int(test_start, test_end, "chargeVoltageMinMv", request.voltage_min_mv);
@@ -565,33 +698,97 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     request.stable_sample_count = param_int(test_start, test_end, "stableSampleCount", request.stable_sample_count);
     request.sample_interval_ms = param_int(test_start, test_end, "sampleIntervalMs", request.sample_interval_ms);
     request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+    wait_charger_timeout_ms = param_int(test_start, test_end, "waitChargerTimeoutMs", wait_charger_timeout_ms);
+    progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     memset(&result, 0, sizeof(result));
     if (set_charge_enabled(1) != 0) {
         snprintf(data, sizeof(data),
                  "{\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":false,"
                  "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,"
                  "\"chargeStage\":\"unknown\",\"chargeVoltageMv\":0,\"chargeCurrentMa\":0,\"stable\":false,"
-                 "\"stableSamples\":0,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d}",
+                 "\"stableSamples\":0,\"averageChargeCurrentMa\":0,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d}",
                  request.voltage_min_mv, request.voltage_max_mv,
                  request.current_min_ma, request.current_max_ma);
         return send_report(fd, "typec_fast_charge", "failed", 4401,
                            "Unable to enable charge before fast charge test", data);
     }
-    send_report(fd, "typec_fast_charge", "running", 0, "Reading fast charge values", "{}");
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+             "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
+             "\"chargeVoltageMv\":0,\"chargeCurrentMa\":0,\"averageChargeCurrentMa\":0,\"stable\":false,\"stableSamples\":0,"
+             "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":0}",
+             wait_charger_timeout_ms);
+    send_report(fd, "typec_fast_charge", "running", 0, "Please insert charger", data);
+
+    /*
+     * OTG must stay connected for ADB transport, so VBUS can already be high.
+     * Only treat charger insertion as valid when PMIC reports a charger-type
+     * VBUS source instead of SDP/CDP/OTG-only power.
+     */
+    while (elapsed_ms <= wait_charger_timeout_ms) {
+        if (read_charge_status_bits(&pmic_status0, &pmic_status1, &vbus_present, &pg_stat, &chg_stat, &vbus_stat, &bc12_done) == 0) {
+            if (vbus_present && pg_stat && is_external_charger_type(vbus_stat)) {
+                snprintf(data, sizeof(data),
+                         "{\"phase\":\"charger_detected\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+                         "\"pmicCommunicationOk\":true,\"chargerConnected\":true,\"charging\":%s,\"chargeStage\":\"%s\","
+                         "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"elapsedMs\":%d}",
+                         chg_stat != 0 ? "true" : "false",
+                         map_charge_stage_name(chg_stat),
+                         pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done, elapsed_ms);
+                send_report(fd, "typec_fast_charge", "running", 0, "Charger detected, start sampling", data);
+                break;
+            }
+
+            snprintf(data, sizeof(data),
+                     "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+                     "\"pmicCommunicationOk\":true,\"chargerConnected\":%s,\"charging\":false,\"chargeStage\":\"not_charging\","
+                     "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
+                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d}",
+                     is_external_charger_type(vbus_stat) ? "true" : "false",
+                     pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
+                     wait_charger_timeout_ms, elapsed_ms);
+            send_report(fd, "typec_fast_charge", "running", 0,
+                        is_external_charger_type(vbus_stat) ? "Waiting for charger stabilization" : "Waiting for external charger, OTG power does not count",
+                        data);
+        } else {
+            snprintf(data, sizeof(data),
+                     "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+                     "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"unknown\","
+                     "\"vbusType\":\"unknown\",\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d}",
+                     wait_charger_timeout_ms, elapsed_ms);
+            send_report(fd, "typec_fast_charge", "running", 0, "Waiting for charger, PMIC status read retrying", data);
+        }
+
+        if (elapsed_ms >= wait_charger_timeout_ms) {
+            snprintf(data, sizeof(data),
+                     "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+                     "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
+                     "\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
+                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"failureReason\":\"charger_insert_timeout\"}",
+                     vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
+                     wait_charger_timeout_ms, elapsed_ms);
+            return send_report(fd, "typec_fast_charge", "failed", 4405, "Charger insert timeout", data);
+        }
+
+        sleep_ms_local(progress_report_interval_ms);
+        elapsed_ms += progress_report_interval_ms;
+    }
+
     if (fast_charge_open(&device) != 0 ||
         fast_charge_run_test(&device, &request, &result) != 0) {
         fast_charge_close(&device);
+        /* PMIC read failure must not be reported as charger-connected/charging. */
         snprintf(data, sizeof(data),
-                 "{\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
-                 "\"pmicCommunicationOk\":false,\"chargerConnected\":%s,\"charging\":%s,\"chargeStage\":\"%s\","
+                 "{\"phase\":\"sampling_failed\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+                 "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"unknown\","
                  "\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"stable\":false,\"stableSamples\":0,"
-                 "\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d}",
-                 result.charger_online ? "true" : "false",
-                 result.charger_online ? "true" : "false",
-                 result.charger_online ? "unknown" : "not_charging",
-                 result.voltage_mv, result.current_ma,
+                 "\"averageChargeCurrentMa\":%d,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
+                 "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d}",
+                 result.voltage_mv, result.current_ma, result.current_ma,
                  request.voltage_min_mv, request.voltage_max_mv,
-                 request.current_min_ma, request.current_max_ma);
+                 request.current_min_ma, request.current_max_ma,
+                 pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done);
         send_report(fd, "typec_fast_charge", "failed",
                     result.error_code == 0 ? 4400 : result.error_code,
                     result.message[0] == '\0' ? "Fast charge test failed" : result.message,
@@ -600,18 +797,18 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     }
     fast_charge_close(&device);
     snprintf(data, sizeof(data),
-             "{\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
+             "{\"phase\":\"ready_for_host_decision\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
              "\"pmicCommunicationOk\":true,\"chargerConnected\":%s,\"charging\":%s,\"chargeStage\":\"%s\","
              "\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"stable\":%s,\"stableSamples\":%d,"
-             "\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
-             "\"readyForHostDecision\":true}",
+             "\"averageChargeCurrentMa\":%d,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
+             "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"readyForHostDecision\":true}",
              result.charger_online ? "true" : "false",
              result.charger_online ? "true" : "false",
              result.current_ma >= request.current_min_ma ? "cc" : "attached",
              result.voltage_mv, result.current_ma,
              result.stable_samples >= request.stable_sample_count ? "true" : "false",
-             result.stable_samples, request.voltage_min_mv, request.voltage_max_mv,
-             request.current_min_ma, request.current_max_ma);
+             result.stable_samples, result.current_ma, request.voltage_min_mv, request.voltage_max_mv,
+             request.current_min_ma, request.current_max_ma, pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done);
     send_report(fd, "typec_fast_charge", "running", 0, "Waiting for host decision", data);
     switch (wait_test_decision(fd, "typec_fast_charge", request.timeout_ms, &passed)) {
     case 1:

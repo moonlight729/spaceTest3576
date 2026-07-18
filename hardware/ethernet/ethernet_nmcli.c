@@ -123,10 +123,12 @@ int ethernet_nmcli_run_test(const struct ethernet_request *request,
     snprintf(result->interface_name, sizeof(result->interface_name), "%s", request->interface_name);
     snprintf(result->router_ip, sizeof(result->router_ip), "%s", request->router_ip);
     result->avg_delay_ms = -1;
+    result->failure_reason[0] = '\0';
 
     if (run_command("nmcli radio wifi off >/dev/null 2>&1") != 0) {
         result->error_code = 4805;
         snprintf(result->message, sizeof(result->message), "Unable to disable Wi-Fi before Ethernet test");
+        snprintf(result->failure_reason, sizeof(result->failure_reason), "ethernet_disable_wifi_failed");
         return -1;
     }
     result->wifi_disabled = true;
@@ -139,6 +141,7 @@ int ethernet_nmcli_run_test(const struct ethernet_request *request,
     if (wait_carrier(request->interface_name, 1, request->timeout_ms) != 0) {
         result->error_code = 4801;
         snprintf(result->message, sizeof(result->message), "Ethernet cable is not inserted");
+        snprintf(result->failure_reason, sizeof(result->failure_reason), "ethernet_cable_not_inserted");
         return -1;
     }
     result->link_up = true;
@@ -147,6 +150,7 @@ int ethernet_nmcli_run_test(const struct ethernet_request *request,
     if (wait_ipv4(request->interface_name, result->ip, sizeof(result->ip), wait_ip_ms) != 0) {
         result->error_code = 4802;
         snprintf(result->message, sizeof(result->message), "Ethernet IP address was not acquired");
+        snprintf(result->failure_reason, sizeof(result->failure_reason), "ethernet_no_ip");
         return -1;
     }
     result->ip_acquired = true;
@@ -154,6 +158,7 @@ int ethernet_nmcli_run_test(const struct ethernet_request *request,
     if (ping_router(request->interface_name, request->router_ip, request->ping_count) != 0) {
         result->error_code = 4803;
         snprintf(result->message, sizeof(result->message), "Ethernet router ping failed");
+        snprintf(result->failure_reason, sizeof(result->failure_reason), "ethernet_ping_failed");
         return -1;
     }
     result->ping_ok = true;
