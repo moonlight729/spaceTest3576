@@ -723,8 +723,12 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     struct fast_charge_result result;
     char data[512];
     int wait_charger_timeout_ms = 30000;
+    int wait_ready_timeout_ms = 120000;
     int progress_report_interval_ms = 1000;
     int elapsed_ms = 0;
+    int ready_elapsed_ms = 0;
+    int ethernet_link_up = 0;
+    int camera_present = 0;
     int pmic_status0 = 0;
     int pmic_status1 = 0;
     int vbus_present = 0;
@@ -748,10 +752,55 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     request.stable_sample_count = param_int(test_start, test_end, "stableSampleCount", request.stable_sample_count);
     request.sample_interval_ms = param_int(test_start, test_end, "sampleIntervalMs", request.sample_interval_ms);
     request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+    wait_ready_timeout_ms = param_int(test_start, test_end, "waitReadyTimeoutMs", wait_ready_timeout_ms);
     wait_charger_timeout_ms = param_int(test_start, test_end, "waitChargerTimeoutMs", wait_charger_timeout_ms);
     progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     memset(&result, 0, sizeof(result));
+
+    ethernet_link_up = net_carrier_is_up("end0");
+    camera_present = any_camera_device_present();
+    while (ready_elapsed_ms < wait_ready_timeout_ms && (ethernet_link_up || camera_present)) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"ethernetLinkUp\":%s,\"cameraPresent\":%s,"
+                 "\"requiresEthernetUnplug\":%s,\"requiresCameraUnplug\":%s}",
+                 wait_ready_timeout_ms, ready_elapsed_ms,
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false",
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false");
+        send_report(fd, "typec_fast_charge", "running", 0,
+                    "Please unplug Ethernet cable and camera before fast charge test", data);
+        sleep_ms_local(progress_report_interval_ms);
+        ready_elapsed_ms += progress_report_interval_ms;
+        ethernet_link_up = net_carrier_is_up("end0");
+        camera_present = any_camera_device_present();
+    }
+
+    if (ethernet_link_up || camera_present) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"ethernetLinkUp\":%s,\"cameraPresent\":%s,"
+                 "\"requiresEthernetUnplug\":%s,\"requiresCameraUnplug\":%s,"
+                 "\"failureReason\":\"external_load_not_removed\"}",
+                 wait_ready_timeout_ms, wait_ready_timeout_ms,
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false",
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false");
+        return send_report(fd, "typec_fast_charge", "failed", 4406,
+                           "Please unplug Ethernet cable and camera before fast charge test", data);
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+             "\"ethernetLinkUp\":false,\"cameraPresent\":false,"
+             "\"requiresEthernetUnplug\":false,\"requiresCameraUnplug\":false}",
+             wait_ready_timeout_ms, ready_elapsed_ms);
+    send_report(fd, "typec_fast_charge", "running", 0,
+                "External loads removed, enabling fast charge mode", data);
+
     if (set_charge_enabled(1) != 0) {
         snprintf(data, sizeof(data),
                  "{\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":false,"
@@ -767,8 +816,8 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
              "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
              "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
              "\"chargeVoltageMv\":0,\"chargeCurrentMa\":0,\"averageChargeCurrentMa\":0,\"stable\":false,\"stableSamples\":0,"
-             "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":0}",
-             wait_charger_timeout_ms);
+             "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":0,\"samplingDurationMs\":%d}",
+             wait_charger_timeout_ms, request.timeout_ms);
     send_report(fd, "typec_fast_charge", "running", 0, "Please insert charger", data);
 
     /*
@@ -789,10 +838,10 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
                 snprintf(data, sizeof(data),
                          "{\"phase\":\"charger_detected\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                          "\"pmicCommunicationOk\":true,\"chargerConnected\":true,\"charging\":%s,\"chargeStage\":\"%s\","
-                         "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"elapsedMs\":%d}",
+                         "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
                          chg_stat != 0 ? "true" : "false",
                          map_charge_stage_name(chg_stat),
-                         pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done, elapsed_ms);
+                         pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done, elapsed_ms, request.timeout_ms);
                 send_report(fd, "typec_fast_charge", "running", 0, "Charger detected, start sampling", data);
                 break;
             }
@@ -801,10 +850,10 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                      "\"pmicCommunicationOk\":true,\"chargerConnected\":%s,\"charging\":false,\"chargeStage\":\"not_charging\","
                      "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
-                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d}",
+                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
                      is_external_charger_type(vbus_stat) ? "true" : "false",
                      pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
-                     wait_charger_timeout_ms, elapsed_ms);
+                     wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
             send_report(fd, "typec_fast_charge", "running", 0,
                         is_external_charger_type(vbus_stat) ? "Waiting for charger stabilization" : "Waiting for external charger, OTG power does not count",
                         data);
@@ -812,8 +861,8 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
             snprintf(data, sizeof(data),
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                      "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"unknown\","
-                     "\"vbusType\":\"unknown\",\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d}",
-                     wait_charger_timeout_ms, elapsed_ms);
+                     "\"vbusType\":\"unknown\",\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
+                     wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
             send_report(fd, "typec_fast_charge", "running", 0, "Waiting for charger, PMIC status read retrying", data);
         }
 
@@ -822,9 +871,9 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                      "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
                      "\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
-                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"failureReason\":\"charger_insert_timeout\"}",
+                     "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d,\"failureReason\":\"charger_insert_timeout\"}",
                      vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
-                     wait_charger_timeout_ms, elapsed_ms);
+                     wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
             return send_report(fd, "typec_fast_charge", "failed", 4405, "Charger insert timeout", data);
         }
 
@@ -847,13 +896,14 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
                  "\"chargerConnected\":%s,\"charging\":%s,\"chargeStage\":\"%s\","
                  "\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"stable\":false,\"stableSamples\":0,"
                  "\"averageChargeCurrentMa\":%d,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
+                 "\"samplingDurationMs\":%d,"
                  "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d}",
                  charger_detected ? "true" : "false",
                  last_known_charging ? "true" : "false",
                  charger_detected ? map_charge_stage_name(last_known_charge_stage) : "unknown",
                  result.voltage_mv, result.current_ma, result.current_ma,
                  request.voltage_min_mv, request.voltage_max_mv,
-                 request.current_min_ma, request.current_max_ma,
+                 request.current_min_ma, request.current_max_ma, request.timeout_ms,
                  charger_detected ? last_known_pmic_status0 : pmic_status0,
                  charger_detected ? last_known_pmic_status1 : pmic_status1,
                  charger_detected ? last_known_vbus_stat : vbus_stat,
@@ -871,6 +921,7 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
              "\"pmicCommunicationOk\":true,\"chargerConnected\":%s,\"charging\":%s,\"chargeStage\":\"%s\","
              "\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"stable\":%s,\"stableSamples\":%d,"
              "\"averageChargeCurrentMa\":%d,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
+             "\"samplingDurationMs\":%d,"
              "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"readyForHostDecision\":true}",
              result.charger_online ? "true" : "false",
              result.charger_online ? "true" : "false",
@@ -878,7 +929,8 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
              result.voltage_mv, result.current_ma,
              result.stable_samples >= request.stable_sample_count ? "true" : "false",
              result.stable_samples, result.current_ma, request.voltage_min_mv, request.voltage_max_mv,
-             request.current_min_ma, request.current_max_ma, pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done);
+             request.current_min_ma, request.current_max_ma, request.timeout_ms,
+             pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done);
     send_report(fd, "typec_fast_charge", "running", 0, "Waiting for host decision", data);
     switch (wait_test_decision(fd, "typec_fast_charge", request.timeout_ms, &passed)) {
     case 1:
@@ -897,7 +949,7 @@ static int run_battery_management(int fd, const char *test_start, const char *te
 {
     char data[512];
     int timeout_ms = 15000;
-    int wait_ready_timeout_ms = 30000;
+    int wait_ready_timeout_ms = 120000;
     int progress_report_interval_ms = 1000;
     int elapsed_ms = 0;
     int ethernet_link_up = 0;
@@ -962,7 +1014,8 @@ static int run_battery_management(int fd, const char *test_start, const char *te
 
     snprintf(data, sizeof(data),
              "{\"phase\":\"ready_for_host_decision\",\"chargeControlCommand\":\"disable_charge\",\"chargeControlOk\":true,"
-             "\"pmicCommunicationOk\":true,\"readyForHostDecision\":true}");
+             "\"pmicCommunicationOk\":true,\"readyForHostDecision\":true,\"samplingDurationMs\":%d}",
+             timeout_ms);
     send_report(fd, "battery_management", "running", 0, "Battery discharge mode enabled, waiting for host decision", data);
     switch (wait_test_decision(fd, "battery_management", timeout_ms, &passed)) {
     case 1:
@@ -1098,17 +1151,17 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
     const uint32_t expected = (1U << (KEY_INPUT_CONFIRM + 1)) - 1U;
     struct key_input input;
     struct key_input_event event;
-    struct timespec start, now;
+    struct timespec deadline_start, now;
     uint32_t detected = 0;
     int timeout_ms = param_int(test_start, test_end, "timeoutMs", config->keys_timeout_ms);
     char data[256];
 
-    if (timeout_ms < 30000) timeout_ms = 30000;
+    if (timeout_ms < 45000) timeout_ms = 45000;
     snprintf(data, sizeof(data),
-             "{\"expectedKeys\":[\"up\",\"down\",\"left\",\"right\",\"confirm\"],\"detectedMask\":0,\"expectedMask\":%u,\"timeoutMs\":%d}",
-             expected, timeout_ms);
+             "{\"expectedKeys\":[\"up\",\"down\",\"left\",\"right\",\"confirm\"],\"detectedMask\":0,\"expectedMask\":%u,\"timeoutMs\":%d,\"remainingMs\":%d}",
+             expected, timeout_ms, timeout_ms);
     send_report(fd, "keys", "running", 0,
-                "Press Up, Down, Left, Right and Confirm within 30 seconds",
+                "Press Up, Down, Left, Right and Confirm within 45 seconds",
                 data);
     if (key_input_open(&input) != 0) {
         send_report(fd, "keys", "failed", 4000, "Unable to open key input devices", "{}");
@@ -1116,16 +1169,16 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
     }
     key_input_drain_pending(&input);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(CLOCK_MONOTONIC, &deadline_start);
     while (detected != expected) {
         int remaining;
         int rc;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        remaining = timeout_ms - elapsed_ms(&start, &now);
+        remaining = timeout_ms - elapsed_ms(&deadline_start, &now);
         if (remaining <= 0) {
             key_input_close(&input);
-            snprintf(data, sizeof(data), "{\"detectedMask\":%u,\"expectedMask\":%u}",
-                     detected, expected);
+            snprintf(data, sizeof(data), "{\"detectedMask\":%u,\"expectedMask\":%u,\"timeoutMs\":%d,\"remainingMs\":0}",
+                     detected, expected, timeout_ms);
             send_report(fd, "keys", "failed", 4001, "Five-key test timed out", data);
             return -1;
         }
@@ -1138,9 +1191,10 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
         if (rc == 0 || !event.pressed || event.key == KEY_INPUT_UNKNOWN) continue;
         if ((detected & (1U << event.key)) == 0) {
             detected |= 1U << event.key;
+            clock_gettime(CLOCK_MONOTONIC, &deadline_start);
             snprintf(data, sizeof(data),
-                     "{\"key\":\"%s\",\"rawCode\":%d,\"detectedMask\":%u,\"expectedMask\":%u,\"timeoutMs\":%d}",
-                     key_input_name(event.key), event.raw_code, detected, expected, timeout_ms);
+                     "{\"key\":\"%s\",\"rawCode\":%d,\"detectedMask\":%u,\"expectedMask\":%u,\"timeoutMs\":%d,\"remainingMs\":%d}",
+                     key_input_name(event.key), event.raw_code, detected, expected, timeout_ms, timeout_ms);
             send_report(fd, "keys", "running", 0, "Key press detected", data);
         }
     }
@@ -1155,6 +1209,9 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
 {
     char device_path[128];
     char exposure_counter_path[160];
+    int wait_camera_timeout_ms = 30000;
+    int progress_report_interval_ms = 1000;
+    int elapsed_ms = 0;
     struct camera_stream_request request = {
         .device_path = device_path,
         .stream_frame_count = config->camera_stream_frame_count,
@@ -1178,12 +1235,40 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
     request.exposure_frame_count = param_int(test_start, test_end, "minInterruptCount", request.exposure_frame_count);
     request.exposure_frame_count = param_int(test_start, test_end, "exposureFrameCount", request.exposure_frame_count);
     request.require_exposure_interrupt = param_bool(test_start, test_end, "requireExposureInterrupt", request.require_exposure_interrupt);
+    wait_camera_timeout_ms = param_int(test_start, test_end, "waitCameraTimeoutMs", wait_camera_timeout_ms);
+    progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     if (exposure_counter_path[0] != '\0') request.require_exposure_interrupt = 1;
     memset(&result, 0, sizeof(result));
-    send_report(fd, "typec_camera", "running", 0, "Running camera stream test", "{}");
+
+    while (elapsed_ms < wait_camera_timeout_ms && access(device_path, F_OK) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_camera\",\"device\":\"%s\",\"cameraPresent\":false,"
+                 "\"requiresCameraInsert\":true,\"waitCameraTimeoutMs\":%d,\"elapsedMs\":%d}",
+                 device_path, wait_camera_timeout_ms, elapsed_ms);
+        send_report(fd, "typec_camera", "running", 0, "Please insert camera before camera test", data);
+        sleep_ms_local(progress_report_interval_ms);
+        elapsed_ms += progress_report_interval_ms;
+    }
+
+    if (access(device_path, F_OK) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_camera\",\"device\":\"%s\",\"cameraPresent\":false,"
+                 "\"requiresCameraInsert\":true,\"waitCameraTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"failureReason\":\"camera_not_inserted\"}",
+                 device_path, wait_camera_timeout_ms, wait_camera_timeout_ms);
+        return send_report(fd, "typec_camera", "failed", 4706, "Camera insert timeout", data);
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"camera_detected\",\"device\":\"%s\",\"cameraPresent\":true,"
+             "\"requiresCameraInsert\":false,\"waitCameraTimeoutMs\":%d,\"elapsedMs\":%d}",
+             device_path, wait_camera_timeout_ms, elapsed_ms);
+    send_report(fd, "typec_camera", "running", 0, "Camera detected, starting stream test", data);
+
     if (camera_stream_run_test(&request, &result) != 0) {
         snprintf(data, sizeof(data),
-                 "{\"device\":\"%s\",\"capturedFrames\":%d,\"exposureDelta\":%d,\"streamOk\":%s,\"exposureOk\":%s,\"requiredExposureFrames\":%d}",
+                 "{\"phase\":\"failed\",\"device\":\"%s\",\"capturedFrames\":%d,\"exposureDelta\":%d,\"streamOk\":%s,\"exposureOk\":%s,\"requiredExposureFrames\":%d}",
                  result.device_path, result.captured_frames, result.exposure_delta,
                  result.stream_ok ? "true" : "false",
                  result.exposure_ok ? "true" : "false",
@@ -1195,7 +1280,7 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
         return -1;
     }
     snprintf(data, sizeof(data),
-             "{\"device\":\"%s\",\"capturedFrames\":%d,\"exposureDelta\":%d,\"streamOk\":%s,\"exposureOk\":%s,\"requiredExposureFrames\":%d}",
+             "{\"phase\":\"completed\",\"device\":\"%s\",\"capturedFrames\":%d,\"exposureDelta\":%d,\"streamOk\":%s,\"exposureOk\":%s,\"requiredExposureFrames\":%d}",
              result.device_path, result.captured_frames, result.exposure_delta,
              result.stream_ok ? "true" : "false",
              result.exposure_ok ? "true" : "false",
