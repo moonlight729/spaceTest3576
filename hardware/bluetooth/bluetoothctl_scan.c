@@ -79,7 +79,9 @@ int bluetoothctl_scan_target(const struct bluetooth_request *request,
 {
     FILE *stream;
     char command[128], line[LINE_SIZE];
-    bool candidate = false;
+    char current_mac[32] = "";
+    char current_name[128] = "";
+    bool current_is_target = false;
     int seconds, status;
 
     if (request == NULL || result == NULL || request->target_name == NULL ||
@@ -100,20 +102,28 @@ int bluetoothctl_scan_target(const struct bluetooth_request *request,
         char mac[32] = "", name[128] = "";
         int rssi;
         if (parse_device_line(line, mac, sizeof(mac), name, sizeof(name))) {
-            if (strcmp(name, request->target_name) == 0) {
-                candidate = true;
+            snprintf(current_mac, sizeof(current_mac), "%s", mac);
+            snprintf(current_name, sizeof(current_name), "%s", name);
+            current_is_target = strcmp(name, request->target_name) == 0;
+            if (current_is_target) {
                 snprintf(result->name, sizeof(result->name), "%s", name);
                 snprintf(result->mac, sizeof(result->mac), "%s", mac);
             }
         }
         if (parse_rssi_line(line, mac, sizeof(mac), &rssi)) {
-            if (candidate && result->mac[0] != '\0' && strcmp(mac, result->mac) == 0) {
+            if (current_is_target &&
+                result->mac[0] != '\0' &&
+                current_mac[0] != '\0' &&
+                strcmp(mac, result->mac) == 0 &&
+                strcmp(mac, current_mac) == 0) {
                 result->matched_rssi = rssi;
                 result->rssi = rssi;
                 update_best_seen(result, result->name, result->mac, rssi);
                 if (rssi >= request->min_rssi) result->found = true;
-            } else if (result->best_seen_mac[0] != '\0' && strcmp(mac, result->best_seen_mac) == 0) {
-                if (rssi > result->best_seen_rssi) result->best_seen_rssi = rssi;
+            } else if (current_mac[0] != '\0' &&
+                       current_name[0] != '\0' &&
+                       strcmp(mac, current_mac) == 0) {
+                update_best_seen(result, current_name, current_mac, rssi);
             }
         }
         if (strstr(line, "Device ") != NULL && strstr(line, "RSSI:") != NULL) {
@@ -129,7 +139,7 @@ int bluetoothctl_scan_target(const struct bluetooth_request *request,
     if (result->found) return 0;
     if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         set_error(result, 4202, "bluetoothctl scan failed", "bluetoothctl_error");
-    } else if (candidate) {
+    } else if (result->mac[0] != '\0') {
         set_error(result, 4203, "Target found but RSSI is below threshold", "target_found_but_rssi_low");
     } else {
         set_error(result, 4204, "Target Bluetooth name was not found", "target_not_found");

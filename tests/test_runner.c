@@ -187,6 +187,19 @@ static void sleep_ms_local(int ms)
     nanosleep(&ts, NULL);
 }
 
+static int any_camera_device_present(void)
+{
+    int index;
+    char path[32];
+    for (index = 0; index < 10; ++index) {
+        snprintf(path, sizeof(path), "/dev/video%d", index);
+        if (access(path, F_OK) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int send_report(int fd, const char *test_id, const char *status,
                        int code, const char *message, const char *data_json)
 {
@@ -298,6 +311,8 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     struct wifi_device device;
     char ssid[128];
     char router_ip[64];
+    int elapsed_ms = 0;
+    int progress_report_interval_ms = 1000;
     struct wifi_request request = {
         .ssid = ssid,
         .password = NULL,
@@ -324,6 +339,8 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     if (request.ethernet_interface_name_buffer[0] != '\0') request.ethernet_interface_name = request.ethernet_interface_name_buffer;
     request.wait_ethernet_unplug = param_bool(test_start, test_end, "waitEthernetUnplug", request.wait_ethernet_unplug);
     request.unplug_timeout_ms = param_int(test_start, test_end, "unplugTimeoutMs", request.unplug_timeout_ms);
+    progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     memset(&result, 0, sizeof(result));
     snprintf(data, sizeof(data),
              "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"waitEthernetUnplug\":%s,\"unplugTimeoutMs\":%d}",
@@ -332,17 +349,42 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
              request.unplug_timeout_ms);
     send_report(fd, "wifi", "running", 0, "Running Wi-Fi test", data);
     if (request.wait_ethernet_unplug && net_carrier_is_up(request.ethernet_interface_name)) {
+        while (elapsed_ms < request.unplug_timeout_ms && net_carrier_is_up(request.ethernet_interface_name)) {
+            snprintf(data, sizeof(data),
+                     "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"wait_unplug\","
+                     "\"waitEthernetUnplug\":true,\"unplugTimeoutMs\":%d,\"elapsedMs\":%d,"
+                     "\"ethernetLinkUp\":true,\"requiresCableUnplug\":true}",
+                     ssid, router_ip, request.ethernet_interface_name,
+                     request.unplug_timeout_ms, elapsed_ms);
+            send_report(fd, "wifi", "running", 0, "Please unplug Ethernet cable before Wi-Fi test", data);
+            sleep_ms_local(progress_report_interval_ms);
+            elapsed_ms += progress_report_interval_ms;
+        }
+
+        if (net_carrier_is_up(request.ethernet_interface_name)) {
+            snprintf(data, sizeof(data),
+                     "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"wait_unplug\","
+                     "\"waitEthernetUnplug\":true,\"unplugTimeoutMs\":%d,\"elapsedMs\":%d,"
+                     "\"ethernetLinkUp\":true,\"requiresCableUnplug\":true,\"failureReason\":\"ethernet_still_connected\"}",
+                     ssid, router_ip, request.ethernet_interface_name,
+                     request.unplug_timeout_ms, request.unplug_timeout_ms);
+            send_report(fd, "wifi", "failed", 4105, "Please unplug Ethernet cable before Wi-Fi test", data);
+            return -1;
+        }
+
         snprintf(data, sizeof(data),
-                 "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"waitEthernetUnplug\":true,"
-                 "\"unplugTimeoutMs\":%d,\"ethernetLinkUp\":true,\"requiresCableUnplug\":true}",
-                 ssid, router_ip, request.ethernet_interface_name, request.unplug_timeout_ms);
-        send_report(fd, "wifi", "running", 0, "Please unplug Ethernet cable before Wi-Fi test", data);
+                 "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"unplugged\","
+                 "\"waitEthernetUnplug\":true,\"unplugTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"ethernetLinkUp\":false,\"requiresCableUnplug\":false}",
+                 ssid, router_ip, request.ethernet_interface_name,
+                 request.unplug_timeout_ms, elapsed_ms);
+        send_report(fd, "wifi", "running", 0, "Ethernet cable unplugged, starting Wi-Fi test", data);
     }
     if (wifi_nmcli_open(&device, NULL) != 0 ||
         wifi_nmcli_run_test(&device, &request, &result) != 0) {
         wifi_nmcli_close(&device);
         snprintf(data, sizeof(data),
-                 "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"wifiEnabled\":%s,\"connected\":%s,"
+                 "{\"ssid\":\"%s\",\"routerIp\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"failed\",\"wifiEnabled\":%s,\"connected\":%s,"
                  "\"ipAcquired\":%s,\"pingOk\":%s,\"ip\":\"%s\",\"activeSsid\":\"%s\",\"ethernetLinkUp\":%s,"
                  "\"requiresCableUnplug\":%s,\"failureReason\":\"%s\"}",
                  ssid, router_ip, device.interface_name,
@@ -361,7 +403,8 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     }
     wifi_nmcli_close(&device);
     snprintf(data, sizeof(data),
-             "{\"ssid\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,\"interfaceName\":\"%s\"}",
+             "{\"ssid\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,"
+             "\"interfaceName\":\"%s\",\"phase\":\"completed\"}",
              ssid, result.ip, router_ip,
              result.completed_ping_count, result.avg_delay_ms, device.interface_name);
     return send_report(fd, "wifi", "passed", 0, "Wi-Fi test passed", data);
@@ -689,6 +732,13 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     int chg_stat = 0;
     int vbus_stat = 0;
     int bc12_done = 0;
+    int charger_detected = 0;
+    int last_known_charging = 0;
+    int last_known_charge_stage = 0;
+    int last_known_pmic_status0 = 0;
+    int last_known_pmic_status1 = 0;
+    int last_known_vbus_stat = 0;
+    int last_known_bc12_done = 0;
     int passed = 0;
 
     request.voltage_min_mv = param_int(test_start, test_end, "chargeVoltageMinMv", request.voltage_min_mv);
@@ -729,6 +779,13 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     while (elapsed_ms <= wait_charger_timeout_ms) {
         if (read_charge_status_bits(&pmic_status0, &pmic_status1, &vbus_present, &pg_stat, &chg_stat, &vbus_stat, &bc12_done) == 0) {
             if (vbus_present && pg_stat && is_external_charger_type(vbus_stat)) {
+                charger_detected = 1;
+                last_known_charging = chg_stat != 0;
+                last_known_charge_stage = chg_stat;
+                last_known_pmic_status0 = pmic_status0;
+                last_known_pmic_status1 = pmic_status1;
+                last_known_vbus_stat = vbus_stat;
+                last_known_bc12_done = bc12_done;
                 snprintf(data, sizeof(data),
                          "{\"phase\":\"charger_detected\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                          "\"pmicCommunicationOk\":true,\"chargerConnected\":true,\"charging\":%s,\"chargeStage\":\"%s\","
@@ -778,17 +835,30 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     if (fast_charge_open(&device) != 0 ||
         fast_charge_run_test(&device, &request, &result) != 0) {
         fast_charge_close(&device);
-        /* PMIC read failure must not be reported as charger-connected/charging. */
+        /*
+         * Once fast-charge sampling has actually started, preserve the last PMIC
+         * state that successfully proved charger insertion. This lets the host
+         * show "charger was detected and charging started, but PMIC reads later
+         * failed" instead of incorrectly falling back to "charger not connected".
+         */
         snprintf(data, sizeof(data),
                  "{\"phase\":\"sampling_failed\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
-                 "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"unknown\","
+                 "\"pmicCommunicationOk\":false,\"pmicReadFailedAfterSampling\":true,"
+                 "\"chargerConnected\":%s,\"charging\":%s,\"chargeStage\":\"%s\","
                  "\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"stable\":false,\"stableSamples\":0,"
                  "\"averageChargeCurrentMa\":%d,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,"
                  "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d}",
+                 charger_detected ? "true" : "false",
+                 last_known_charging ? "true" : "false",
+                 charger_detected ? map_charge_stage_name(last_known_charge_stage) : "unknown",
                  result.voltage_mv, result.current_ma, result.current_ma,
                  request.voltage_min_mv, request.voltage_max_mv,
                  request.current_min_ma, request.current_max_ma,
-                 pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done);
+                 charger_detected ? last_known_pmic_status0 : pmic_status0,
+                 charger_detected ? last_known_pmic_status1 : pmic_status1,
+                 charger_detected ? last_known_vbus_stat : vbus_stat,
+                 map_vbus_type_name(charger_detected ? last_known_vbus_stat : vbus_stat),
+                 charger_detected ? last_known_bc12_done : bc12_done);
         send_report(fd, "typec_fast_charge", "failed",
                     result.error_code == 0 ? 4400 : result.error_code,
                     result.message[0] == '\0' ? "Fast charge test failed" : result.message,
@@ -827,9 +897,60 @@ static int run_battery_management(int fd, const char *test_start, const char *te
 {
     char data[512];
     int timeout_ms = 15000;
+    int wait_ready_timeout_ms = 30000;
+    int progress_report_interval_ms = 1000;
+    int elapsed_ms = 0;
+    int ethernet_link_up = 0;
+    int camera_present = 0;
     int passed = 0;
 
     timeout_ms = param_int(test_start, test_end, "timeoutMs", timeout_ms);
+    wait_ready_timeout_ms = param_int(test_start, test_end, "waitReadyTimeoutMs", wait_ready_timeout_ms);
+    progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
+
+    ethernet_link_up = net_carrier_is_up("end0");
+    camera_present = any_camera_device_present();
+    while (elapsed_ms < wait_ready_timeout_ms && (ethernet_link_up || camera_present)) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"ethernetLinkUp\":%s,\"cameraPresent\":%s,"
+                 "\"requiresEthernetUnplug\":%s,\"requiresCameraUnplug\":%s}",
+                 wait_ready_timeout_ms, elapsed_ms,
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false",
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false");
+        send_report(fd, "battery_management", "running", 0,
+                    "Please unplug Ethernet cable and camera before battery discharge test", data);
+        sleep_ms_local(progress_report_interval_ms);
+        elapsed_ms += progress_report_interval_ms;
+        ethernet_link_up = net_carrier_is_up("end0");
+        camera_present = any_camera_device_present();
+    }
+
+    if (ethernet_link_up || camera_present) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"ethernetLinkUp\":%s,\"cameraPresent\":%s,"
+                 "\"requiresEthernetUnplug\":%s,\"requiresCameraUnplug\":%s,"
+                 "\"failureReason\":\"external_load_not_removed\"}",
+                 wait_ready_timeout_ms, wait_ready_timeout_ms,
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false",
+                 ethernet_link_up ? "true" : "false",
+                 camera_present ? "true" : "false");
+        return send_report(fd, "battery_management", "failed", 4705,
+                           "Please unplug Ethernet cable and camera before battery discharge test", data);
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"ready\",\"waitReadyTimeoutMs\":%d,\"elapsedMs\":%d,"
+             "\"ethernetLinkUp\":false,\"cameraPresent\":false,"
+             "\"requiresEthernetUnplug\":false,\"requiresCameraUnplug\":false}",
+             wait_ready_timeout_ms, elapsed_ms);
+    send_report(fd, "battery_management", "running", 0,
+                "External loads removed, enabling battery discharge mode", data);
 
     if (set_charge_enabled(0) != 0) {
         snprintf(data, sizeof(data),
@@ -840,7 +961,7 @@ static int run_battery_management(int fd, const char *test_start, const char *te
     }
 
     snprintf(data, sizeof(data),
-             "{\"chargeControlCommand\":\"disable_charge\",\"chargeControlOk\":true,"
+             "{\"phase\":\"ready_for_host_decision\",\"chargeControlCommand\":\"disable_charge\",\"chargeControlOk\":true,"
              "\"pmicCommunicationOk\":true,\"readyForHostDecision\":true}");
     send_report(fd, "battery_management", "running", 0, "Battery discharge mode enabled, waiting for host decision", data);
     switch (wait_test_decision(fd, "battery_management", timeout_ms, &passed)) {
