@@ -698,6 +698,9 @@ static int run_pcba_test_points(int fd, const char *test_start, const char *test
 static int run_bluetooth(int fd, const struct app_config *config, const char *test_start, const char *test_end)
 {
     char target_name[128];
+    int max_retry_count = 5;
+    int retry_interval_ms = 2000;
+    int attempt;
     struct bluetooth_request request = {
         .target_name = target_name,
         .timeout_ms = 8000,
@@ -716,19 +719,54 @@ static int run_bluetooth(int fd, const struct app_config *config, const char *te
     request.min_rssi = param_int(test_start, test_end, "minRssi", request.min_rssi);
     request.timeout_ms = param_int(test_start, test_end, "scanWindowMs", request.timeout_ms);
     request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
-    memset(&result, 0, sizeof(result));
-    snprintf(data, sizeof(data),
-             "{\"targetName\":\"%s\",\"minRssi\":%d,\"scanWindowMs\":%d}",
-             target_name, request.min_rssi, request.timeout_ms);
-    send_report(fd, "bluetooth", "running", 0, "Running Bluetooth scan", data);
-    if (bluetoothctl_scan_target(&request, &result) != 0) {
+    max_retry_count = param_int(test_start, test_end, "maxRetryCount", max_retry_count);
+    retry_interval_ms = param_int(test_start, test_end, "retryIntervalMs", retry_interval_ms);
+    if (max_retry_count <= 0) max_retry_count = 1;
+    if (retry_interval_ms < 0) retry_interval_ms = 0;
+
+    for (attempt = 1; attempt <= max_retry_count; ++attempt) {
+        memset(&result, 0, sizeof(result));
         snprintf(data, sizeof(data),
-                 "{\"targetName\":\"%s\",\"minRssi\":%d,\"scanWindowMs\":%d,\"found\":%s,"
+                 "{\"targetName\":\"%s\",\"minRssi\":%d,\"scanWindowMs\":%d,\"phase\":\"scan_started\","
+                 "\"attempt\":%d,\"maxRetryCount\":%d}",
+                 target_name, request.min_rssi, request.timeout_ms, attempt, max_retry_count);
+        send_report(fd, "bluetooth", "running", 0, "Running Bluetooth scan", data);
+
+        if (bluetoothctl_scan_target(&request, &result) == 0) {
+            snprintf(data, sizeof(data),
+                     "{\"targetName\":\"%s\",\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"minRssi\":%d,"
+                     "\"scanWindowMs\":%d,\"attempt\":%d,\"maxRetryCount\":%d,"
+                     "\"bestSeenName\":\"%s\",\"bestSeenMac\":\"%s\",\"bestSeenRssi\":%d}",
+                     target_name, result.name, result.mac, result.rssi, request.min_rssi,
+                     request.timeout_ms, attempt, max_retry_count,
+                     result.best_seen_name, result.best_seen_mac, result.best_seen_rssi);
+            return send_report(fd, "bluetooth", "passed", 0, "Bluetooth target found", data);
+        }
+
+        if (attempt < max_retry_count) {
+            snprintf(data, sizeof(data),
+                     "{\"targetName\":\"%s\",\"minRssi\":%d,\"scanWindowMs\":%d,\"phase\":\"retry_wait\","
+                     "\"attempt\":%d,\"maxRetryCount\":%d,\"retryIntervalMs\":%d,\"found\":%s,"
+                     "\"matchedName\":\"%s\",\"matchedMac\":\"%s\",\"matchedRssi\":%d,"
+                     "\"bestSeenName\":\"%s\",\"bestSeenMac\":\"%s\",\"bestSeenRssi\":%d,"
+                     "\"failureReason\":\"%s\"}",
+                     target_name, request.min_rssi, request.timeout_ms,
+                     attempt, max_retry_count, retry_interval_ms, result.found ? "true" : "false",
+                     result.name, result.mac, result.matched_rssi,
+                     result.best_seen_name, result.best_seen_mac, result.best_seen_rssi,
+                     result.failure_reason);
+            send_report(fd, "bluetooth", "running", 0, "Bluetooth scan failed, waiting to retry", data);
+            sleep_ms_local(retry_interval_ms);
+            continue;
+        }
+
+        snprintf(data, sizeof(data),
+                 "{\"targetName\":\"%s\",\"minRssi\":%d,\"scanWindowMs\":%d,\"attempt\":%d,\"maxRetryCount\":%d,\"found\":%s,"
                  "\"matchedName\":\"%s\",\"matchedMac\":\"%s\",\"matchedRssi\":%d,"
                  "\"bestSeenName\":\"%s\",\"bestSeenMac\":\"%s\",\"bestSeenRssi\":%d,"
                  "\"failureReason\":\"%s\"}",
                  target_name, request.min_rssi, request.timeout_ms,
-                 result.found ? "true" : "false",
+                 attempt, max_retry_count, result.found ? "true" : "false",
                  result.name, result.mac, result.matched_rssi,
                  result.best_seen_name, result.best_seen_mac, result.best_seen_rssi,
                  result.failure_reason);
@@ -738,12 +776,8 @@ static int run_bluetooth(int fd, const struct app_config *config, const char *te
                     data);
         return -1;
     }
-    snprintf(data, sizeof(data),
-             "{\"targetName\":\"%s\",\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"minRssi\":%d,"
-             "\"scanWindowMs\":%d,\"bestSeenName\":\"%s\",\"bestSeenMac\":\"%s\",\"bestSeenRssi\":%d}",
-             target_name, result.name, result.mac, result.rssi, request.min_rssi,
-             request.timeout_ms, result.best_seen_name, result.best_seen_mac, result.best_seen_rssi);
-    return send_report(fd, "bluetooth", "passed", 0, "Bluetooth target found", data);
+
+    return -1;
 }
 
 static int run_fast_charge(int fd, const struct app_config *config, const char *test_start, const char *test_end)
