@@ -461,8 +461,6 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
         .router_ip = router_ip,
         .ping_count = 4,
         .timeout_ms = 15000,
-        .wait_cable_unplug = true,
-        .unplug_timeout_ms = 10000,
     };
     struct ethernet_result result;
     char data[768];
@@ -471,8 +469,6 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
     param_string(test_start, test_end, "routerIp", router_ip, sizeof(router_ip));
     request.ping_count = param_int(test_start, test_end, "pingCount", request.ping_count);
     request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
-    request.wait_cable_unplug = param_bool(test_start, test_end, "waitCableUnplug", request.wait_cable_unplug);
-    request.unplug_timeout_ms = param_int(test_start, test_end, "unplugTimeoutMs", request.unplug_timeout_ms);
     wait_cable_timeout_ms = param_int(test_start, test_end, "waitCableTimeoutMs", wait_cable_timeout_ms);
     progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
@@ -530,21 +526,9 @@ static int run_ethernet(int fd, const char *test_start, const char *test_end)
 
     snprintf(data, sizeof(data),
              "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,"
-             "\"pingOk\":true,\"phase\":\"ping_ok\",\"ethernetLinkUp\":true}",
+             "\"pingOk\":true,\"phase\":\"completed\",\"ethernetLinkUp\":true}",
              result.interface_name, result.ip, result.router_ip,
              result.completed_ping_count, result.avg_delay_ms);
-    send_report(fd, "ethernet", "running", 0, "Remove Ethernet cable", data);
-    if (request.wait_cable_unplug) {
-        result.cable_unplugged = ethernet_nmcli_wait_cable_unplug(interface_name, request.unplug_timeout_ms) == 0;
-    }
-
-    snprintf(data, sizeof(data),
-             "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"pingCount\":%d,\"avgDelayMs\":%d,"
-             "\"cableUnplugged\":%s,\"phase\":\"completed\",\"ethernetLinkUp\":%s}",
-             result.interface_name, result.ip, result.router_ip,
-             result.completed_ping_count, result.avg_delay_ms,
-             result.cable_unplugged ? "true" : "false",
-             result.link_up ? "true" : "false");
     return send_report(fd, "ethernet", "passed", 0, result.message, data);
 }
 

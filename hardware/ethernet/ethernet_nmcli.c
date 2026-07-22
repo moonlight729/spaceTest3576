@@ -161,9 +161,3 @@ int ethernet_nmcli_run_test(const struct ethernet_request *request,
     snprintf(result->message, sizeof(result->message), "Ethernet test passed");
     return 0;
 }
-
-int ethernet_nmcli_wait_cable_unplug(const char *interface_name, int timeout_ms)
-{
-    if (!safe_token(interface_name)) return -1;
-    return wait_carrier(interface_name, 0, timeout_ms);
-}
