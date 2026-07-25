@@ -1,6 +1,9 @@
 #include "app_config.h"
+#include "version.h"
 
 #include <stdlib.h>
+
+static const char g_spacetest_version[] __attribute__((used)) = SPACETEST_VERSION_STRING;
 
 void app_config_load_defaults(struct app_config *config)
 {
@@ -30,7 +33,7 @@ void app_config_load_defaults(struct app_config *config)
     config->camera_pwm_min_pulse_delta = 1;
     config->application_path = "/vendor/originflow/bin/spacetest3576";
     config->application_service = "pcba-test.service";
-    config->application_version = "1.0.0";
+    config->application_version = SPACETEST_VERSION;
     config->usb_pretest_enabled = 1;
     config->usb_pretest_http_port = 18080;
     if (getenv("SPACETEST_USB_PRETEST_ENABLED") != NULL &&

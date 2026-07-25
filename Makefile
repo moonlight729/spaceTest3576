@@ -26,7 +26,7 @@ all: spacetest3576
 spacetest3576: $(APP_OBJECTS)
 	$(CC) $(CFLAGS) -pthread $(APP_OBJECTS) -o $@
 
-config/app_config.o: config/app_config.c config/app_config.h
+config/app_config.o: config/app_config.c config/app_config.h config/version.h
 	$(CC) $(CFLAGS) -c config/app_config.c -o $@
 protocol/protocol.o: protocol/protocol.c protocol/protocol.h
 	$(CC) $(CFLAGS) -c protocol/protocol.c -o $@
