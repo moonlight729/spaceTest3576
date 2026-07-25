@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
@@ -572,42 +573,35 @@ static int run_tf_card(int fd, const struct app_config *config, const char *test
 static int run_usb2_3(int fd, const char *test_start, const char *test_end)
 {
     char record_file[160] = "/tmp/spacetest_usb_ports.json";
-    struct usb_ports_request request = {
-        .record_file = record_file,
-        .expected_usb2_count = 2,
-        .expected_usb3_count = 2,
-        .timeout_ms = 3000,
-    };
-    struct usb_ports_result result;
-    char data[768];
+    char test_mode[32] = "pcba";
+    char content[4096];
+    char data[1024];
+    FILE *file;
 
     param_string(test_start, test_end, "recordFile", record_file, sizeof(record_file));
-    request.expected_usb2_count = param_int(test_start, test_end, "expectedUsb2Count", request.expected_usb2_count);
-    request.expected_usb3_count = param_int(test_start, test_end, "expectedUsb3Count", request.expected_usb3_count);
-    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+    param_string(test_start, test_end, "mode", test_mode, sizeof(test_mode));
+    snprintf(record_file, sizeof(record_file), "/userdata/factory_test/usb/%s_usb_test.json",
+             strcmp(test_mode, "finished_product") == 0 ? "finished_product" : "pcba");
 
     snprintf(data, sizeof(data),
-             "{\"recordFile\":\"%s\",\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
-             record_file, request.expected_usb2_count, request.expected_usb3_count);
-    send_report(fd, "usb2_3", "running", 0, "Read USB2.0&3.0 summary file", data);
-
-    if (usb_ports_run_test(&request, &result) != 0) {
-        snprintf(data, sizeof(data),
-                 "{\"recordFile\":\"%s\",\"usb2Count\":%d,\"usb3Count\":%d,\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
-                 result.record_file, result.usb2_count, result.usb3_count,
-                 result.expected_usb2_count, result.expected_usb3_count);
-        send_report(fd, "usb2_3", "failed",
-                    result.error_code == 0 ? 4900 : result.error_code,
-                    result.message[0] == '\0' ? "USB2.0&3.0 record check failed" : result.message,
-                    data);
+             "{\"recordFile\":\"%s\",\"mode\":\"%s\",\"requiredUsb2Cycles\":4,\"requiredUsb3Cycles\":4}", record_file, test_mode);
+    send_report(fd, "usb2_3", "running", 0, "Read USB connectivity pretest result", data);
+    file = fopen(record_file, "r");
+    if (file == NULL || fgets(content, sizeof(content), file) == NULL) {
+        if (file != NULL) fclose(file);
+        send_report(fd, "usb2_3", "failed", 4901, "USB pretest result file not found", data);
         return -1;
     }
-
-    snprintf(data, sizeof(data),
-             "{\"recordFile\":\"%s\",\"usb2Count\":%d,\"usb3Count\":%d,\"expectedUsb2Count\":%d,\"expectedUsb3Count\":%d}",
-             result.record_file, result.usb2_count, result.usb3_count,
-             result.expected_usb2_count, result.expected_usb3_count);
-    return send_report(fd, "usb2_3", "passed", 0, result.message, data);
+    fclose(file);
+    if (strstr(content, "\"overallResult\":\"passed\"") == NULL ||
+        strstr(content, "\"usb2Cycles\":4") == NULL ||
+        strstr(content, "\"usb3Cycles\":4") == NULL ||
+        (strcmp(test_mode, "finished_product") == 0 && strstr(content, "\"testMode\":\"finished_product\"") == NULL) ||
+        (strcmp(test_mode, "finished_product") != 0 && strstr(content, "\"testMode\":\"pcba\"") == NULL)) {
+        send_report(fd, "usb2_3", "failed", 4902, "USB pretest connectivity result failed or mode mismatch", data);
+        return -1;
+    }
+    return send_report(fd, "usb2_3", "passed", 0, "USB2.0 and USB3.0 connectivity pretest passed", data);
 }
 
 static void append_pcba_points_json(char *data, size_t data_size,
@@ -1279,6 +1273,79 @@ static int run_manual_observation(int fd, const char *test_id, const char *displ
     }
 }
 
+static int write_fan_pwm(const char *path, int value)
+{
+    char text[32];
+    int length;
+    int fd;
+    if (path == NULL || path[0] == '\0') return -1;
+    fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    length = snprintf(text, sizeof(text), "%d\n", value);
+    if (write(fd, text, (size_t)length) != length) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int read_fan_tach(const char *path, int *value)
+{
+    FILE *file = fopen(path, "r");
+    int scanned;
+    if (file == NULL) return -1;
+    scanned = fscanf(file, "%d", value);
+    fclose(file);
+    return scanned == 1 ? 0 : -1;
+}
+
+static int run_finished_product_fan(int fd, const char *test_start, const char *test_end)
+{
+    char pwm_path[192] = "/sys/class/hwmon/hwmon12/pwm1";
+    char tach_path[192] = "/sys/class/hwmon/hwmon12/tach_rpm";
+    char data[1024];
+    int start_value = param_int(test_start, test_end, "startValue", 100);
+    int stop_value = param_int(test_start, test_end, "stopValue", 0);
+    int settle_ms = param_int(test_start, test_end, "tachSettleMs", 1000);
+    int tach_value = 0;
+
+    param_string(test_start, test_end, "pwmPath", pwm_path, sizeof(pwm_path));
+    param_string(test_start, test_end, "tachPath", tach_path, sizeof(tach_path));
+    if (settle_ms < 0) settle_ms = 0;
+    if (write_fan_pwm(pwm_path, start_value) != 0) {
+        send_report(fd, "fan", "failed", 3920, "Unable to start fan PWM", "{}");
+        return -1;
+    }
+    snprintf(data, sizeof(data),
+             "{\"automatic\":true,\"pwmPath\":\"%s\",\"tachPath\":\"%s\",\"startValue\":%d,\"stopValue\":%d,\"tachSettleMs\":%d}",
+             pwm_path, tach_path, start_value, stop_value, settle_ms);
+    send_report(fd, "fan", "running", 0, "Fan started; checking tach_rpm automatically", data);
+    if (settle_ms > 0) {
+        struct timespec settle_time = {
+            .tv_sec = settle_ms / 1000,
+            .tv_nsec = (long)(settle_ms % 1000) * 1000000L
+        };
+        nanosleep(&settle_time, NULL);
+    }
+    if (read_fan_tach(tach_path, &tach_value) != 0) {
+        write_fan_pwm(pwm_path, stop_value);
+        snprintf(data, sizeof(data), "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRead\":false}", tach_path);
+        send_report(fd, "fan", "failed", 3922, "Unable to read fan tach_rpm", data);
+        return -1;
+    }
+    if (write_fan_pwm(pwm_path, stop_value) != 0) {
+        snprintf(data, sizeof(data), "{\"automatic\":true,\"tachRpm\":%d,\"pwmStopped\":false}", tach_value);
+        send_report(fd, "fan", "failed", 3921, "Unable to stop fan PWM", data);
+        return -1;
+    }
+    snprintf(data, sizeof(data),
+             "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,\"pwmStopped\":true}",
+             tach_path, tach_value, tach_value == 1 ? "true" : "false");
+    return send_report(fd, "fan", tach_value == 1 ? "passed" : "failed", tach_value == 1 ? 0 : 3910,
+                       tach_value == 1 ? "Fan tach_rpm indicates running" : "Fan tach_rpm indicates stopped", data) == 0 && tach_value == 1 ? 0 : -1;
+}
+
 static int run_finished_product_indicator_led(int fd, const char *test_start, const char *test_end)
 {
 #define INDICATOR_LED_ON_BRIGHTNESS 255
@@ -1320,7 +1387,8 @@ static int run_finished_product_indicator_led(int fd, const char *test_start, co
         ready = select(fd + 1, &read_fds, NULL, NULL, &tv);
         if (ready < 0) break;
         if (ready > 0 && protocol_read_line(fd, line, sizeof(line)) > 0 &&
-            strstr(line, "\"event\":\"test.decision\"") != NULL &&
+            (strstr(line, "\"event\":\"operator.decision\"") != NULL ||
+             strstr(line, "\"event\":\"test.decision\"") != NULL) &&
             strstr(line, "indicator_led") != NULL) {
             int passed = strstr(line, "\"passed\":true") != NULL;
             indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
@@ -1627,6 +1695,8 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     if (strcmp(test_id, "hdmi") == 0) return run_manual_observation(fd, "hdmi", "HDMI", test_start, test_end);
     if (strcmp(test_id, "lcd") == 0) return run_manual_observation(fd, "lcd", "LCD", test_start, test_end);
     if (strcmp(test_id, "reset_button") == 0) return run_manual_observation(fd, "reset_button", "Reset button and LCD off state", test_start, test_end);
+    if (strcmp(test_id, "fan") == 0 && strcmp(test_mode, "finished_product") == 0) return run_finished_product_fan(fd, test_start, test_end);
+    if (strcmp(test_id, "fan") == 0) return run_skipped_test(fd, "fan", test_start, test_end);
     if (strcmp(test_id, "indicator_led") == 0 && strcmp(test_mode, "finished_product") == 0) {
         return run_finished_product_indicator_led(fd, test_start, test_end);
     }
