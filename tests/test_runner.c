@@ -1349,12 +1349,17 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
 static int run_finished_product_indicator_led(int fd, const char *test_start, const char *test_end)
 {
 #define INDICATOR_LED_ON_BRIGHTNESS 255
+#define INDICATOR_LED_PHASE_COUNT 3
     struct indicator_led_device device;
     struct indicator_led_result result;
     int timeout_ms = param_int(test_start, test_end, "timeoutMs", 60000);
-    int elapsed_ms = 0;
-    int blue_on = 1;
+    int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 2000);
+    int red_green_overlap_ms = param_int(test_start, test_end, "redGreenOverlapMs", 200);
+    int i2c_timeout_ms = param_int(test_start, test_end, "i2cTimeoutMs", 3000);
+    int retry_interval_ms = param_int(test_start, test_end, "i2cRetryIntervalMs", 100);
     char data[512];
+    int elapsed_ms = 0;
+    int phase;
 
     if (timeout_ms < 30000) timeout_ms = 30000;
     if (indicator_led_open(&device) != 0) {
@@ -1362,28 +1367,68 @@ static int run_finished_product_indicator_led(int fd, const char *test_start, co
         return -1;
     }
 
-    indicator_led_set(&device, INDICATOR_LED_GREEN, 0, &result);
-    if (indicator_led_set(&device, INDICATOR_LED_GREEN, 0, &result) != 0 ||
-        indicator_led_set(&device, INDICATOR_LED_BLUE, INDICATOR_LED_ON_BRIGHTNESS, &result) != 0) {
+    if (phase_ms <= 0) phase_ms = 2000;
+    if (red_green_overlap_ms < 0) red_green_overlap_ms = 0;
+    if (indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result) != 0 ||
+        indicator_led_set(&device, INDICATOR_LED_RED, 0, &result) != 0 ||
+        indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms) != 0) {
         indicator_led_close(&device);
-        send_report(fd, "indicator_led", "failed", 4601, "Unable to set initial indicator LED state", "{}");
+        send_report(fd, "indicator_led", "failed", 4602, "Unable to initialize RGB LED test", "{}");
         return -1;
     }
-    snprintf(data, sizeof(data),
-             "{\"manualObserved\":true,\"requiresOperatorDecision\":true,\"displayMode\":\"alternating\","
-             "\"cycleMs\":2000,\"currentLed\":\"blue\",\"timeoutMs\":%d}", timeout_ms);
-    send_report(fd, "indicator_led", "running", 0, "Waiting for operator to observe alternating LEDs", data);
 
-    while (elapsed_ms < timeout_ms) {
+    for (phase = 0; phase < INDICATOR_LED_PHASE_COUNT; ++phase) {
+        const char *current_led = phase == 0 ? "red" : (phase == 1 ? "green" : "blue");
         fd_set read_fds;
         struct timeval tv;
         char line[PROTOCOL_MAX_LINE];
         int ready;
 
+        if ((phase == 0 &&
+             (indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms) != 0 ||
+              indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result) != 0 ||
+              indicator_led_set(&device, INDICATOR_LED_RED, INDICATOR_LED_ON_BRIGHTNESS, &result) != 0)) ||
+            (phase == 1 &&
+             (indicator_led_set_charge(true, i2c_timeout_ms, retry_interval_ms) != 0 ||
+              indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result) != 0)) ||
+            (phase == 2 &&
+             (indicator_led_set(&device, INDICATOR_LED_BLUE, INDICATOR_LED_ON_BRIGHTNESS, &result) != 0 ||
+              indicator_led_set(&device, INDICATOR_LED_RED, 0, &result) != 0 ||
+              indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms) != 0))) {
+            indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+            indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+            indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms);
+            indicator_led_close(&device);
+            snprintf(data, sizeof(data), "{\"currentLed\":\"%s\"}", current_led);
+            send_report(fd, "indicator_led", "failed", 4601, "Unable to set RGB LED phase", data);
+            return -1;
+        }
+        if (phase == 1) {
+            sleep_ms_local(red_green_overlap_ms);
+            if (indicator_led_set(&device, INDICATOR_LED_RED, 0, &result) != 0) {
+                indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+                indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms);
+                indicator_led_close(&device);
+                send_report(fd, "indicator_led", "failed", 4601, "Unable to switch red LED off", "{}");
+                return -1;
+            }
+        }
+        snprintf(data, sizeof(data),
+                 "{\"manualObserved\":true,\"requiresOperatorDecision\":true,\"displayMode\":\"rgb_sequence\","
+                 "\"phaseDurationMs\":%d,\"currentLed\":\"%s\",\"phaseIndex\":%d,\"phaseCount\":%d,"
+                 "\"redGreenOverlapMs\":%d,\"timeoutMs\":%d}",
+                 phase_ms, current_led, phase + 1, INDICATOR_LED_PHASE_COUNT,
+                 red_green_overlap_ms, timeout_ms);
+        send_report(fd, "indicator_led", "running", 0,
+                    phase == 0 ? "Red LED is on; observe for 2 seconds" :
+                    phase == 1 ? "Green LED is on; observe for 2 seconds" :
+                                 "Blue LED is on; observe for 2 seconds",
+                    data);
+
         FD_ZERO(&read_fds);
         FD_SET(fd, &read_fds);
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
+        tv.tv_sec = phase_ms / 1000;
+        tv.tv_usec = (phase_ms % 1000) * 1000;
         ready = select(fd + 1, &read_fds, NULL, NULL, &tv);
         if (ready < 0) break;
         if (ready > 0 && protocol_read_line(fd, line, sizeof(line)) > 0 &&
@@ -1392,39 +1437,58 @@ static int run_finished_product_indicator_led(int fd, const char *test_start, co
             strstr(line, "indicator_led") != NULL) {
             int passed = strstr(line, "\"passed\":true") != NULL;
             indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
-            indicator_led_set(&device, INDICATOR_LED_GREEN, 0, &result);
+            indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+            indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms);
             indicator_led_close(&device);
             snprintf(data, sizeof(data),
-                     "{\"manualObserved\":true,\"operatorConfirmed\":%s,\"displayMode\":\"alternating\",\"cycleMs\":2000}",
-                     passed ? "true" : "false");
+                     "{\"manualObserved\":true,\"operatorConfirmed\":%s,\"displayMode\":\"rgb_sequence\",\"phaseDurationMs\":%d}",
+                     passed ? "true" : "false", phase_ms);
             return send_report(fd, "indicator_led", passed ? "passed" : "failed",
                                passed ? 0 : 3910,
                                passed ? "Operator confirmed pass" : "Operator confirmed fail", data) == 0 && passed ? 0 : -1;
         }
-
-        blue_on = !blue_on;
-        if (indicator_led_set(&device, INDICATOR_LED_BLUE, blue_on ? INDICATOR_LED_ON_BRIGHTNESS : 0, &result) != 0 ||
-            indicator_led_set(&device, INDICATOR_LED_GREEN, blue_on ? 0 : INDICATOR_LED_ON_BRIGHTNESS, &result) != 0) {
-            indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
-            indicator_led_set(&device, INDICATOR_LED_GREEN, 0, &result);
-            indicator_led_close(&device);
-            send_report(fd, "indicator_led", "failed", 4601, "Unable to switch indicator LED state", "{}");
-            return -1;
-        }
-        elapsed_ms += 2000;
-        snprintf(data, sizeof(data),
-                 "{\"manualObserved\":true,\"requiresOperatorDecision\":true,\"displayMode\":\"alternating\","
-                 "\"cycleMs\":2000,\"currentLed\":\"%s\",\"elapsedMs\":%d,\"timeoutMs\":%d}",
-                 blue_on ? "blue" : "green", elapsed_ms, timeout_ms);
-        send_report(fd, "indicator_led", "running", 0, "Alternating LEDs for operator observation", data);
+        elapsed_ms += phase_ms;
     }
 
     indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
-    indicator_led_set(&device, INDICATOR_LED_GREEN, 0, &result);
+    indicator_led_set_charge(false, i2c_timeout_ms, retry_interval_ms);
+    indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+
+    while (elapsed_ms < timeout_ms) {
+        fd_set read_fds;
+        struct timeval tv;
+        char line[PROTOCOL_MAX_LINE];
+        int ready;
+        int wait_ms = timeout_ms - elapsed_ms;
+
+        if (wait_ms > 1000) wait_ms = 1000;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        tv.tv_sec = wait_ms / 1000;
+        tv.tv_usec = (wait_ms % 1000) * 1000;
+        ready = select(fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ready < 0) break;
+        if (ready > 0 && protocol_read_line(fd, line, sizeof(line)) > 0 &&
+            (strstr(line, "\"event\":\"operator.decision\"") != NULL ||
+             strstr(line, "\"event\":\"test.decision\"") != NULL) &&
+            strstr(line, "indicator_led") != NULL) {
+            int passed = strstr(line, "\"passed\":true") != NULL;
+            indicator_led_close(&device);
+            snprintf(data, sizeof(data),
+                     "{\"manualObserved\":true,\"operatorConfirmed\":%s,\"displayMode\":\"rgb_sequence\",\"phaseDurationMs\":%d}",
+                     passed ? "true" : "false", phase_ms);
+            return send_report(fd, "indicator_led", passed ? "passed" : "failed",
+                               passed ? 0 : 3910,
+                               passed ? "Operator confirmed pass" : "Operator confirmed fail", data) == 0 && passed ? 0 : -1;
+        }
+        elapsed_ms += wait_ms;
+    }
+
     indicator_led_close(&device);
-    send_report(fd, "indicator_led", "failed", 3911, "Operator decision timed out", "{\"displayMode\":\"alternating\",\"cycleMs\":2000}");
+    send_report(fd, "indicator_led", "failed", 3911, "Operator decision timed out", "{\"displayMode\":\"rgb_sequence\"}");
     return -1;
 #undef INDICATOR_LED_ON_BRIGHTNESS
+#undef INDICATOR_LED_PHASE_COUNT
 }
 
 static int run_recovery_adc(int fd, const char *test_start, const char *test_end)
