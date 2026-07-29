@@ -359,11 +359,11 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
         if (wifi_nmcli_scan_signal(&device, &request, &result) != 0) {
             snprintf(data, sizeof(data),
                      "{\"ssid\":\"%s\",\"interfaceName\":\"%s\",\"attempt\":%d,\"maxRetryCount\":%d,"
-                     "\"scanTimeoutMs\":%d,\"wifiEnabled\":%s,\"found\":false,\"rssi\":%d,"
+                     "\"scanTimeoutMs\":%d,\"wifiEnabled\":%s,\"found\":false,\"rssi\":%d,\"scanRetryCount\":%d,"
                      "\"failureReason\":\"%s\"}",
                      ssid, device.interface_name, attempt, max_retry_count,
                      scan_timeout_ms, result.wifi_enabled ? "true" : "false", result.rssi,
-                     result.failure_reason);
+                     result.scan_retry_count, result.failure_reason);
             wifi_nmcli_close(&device);
             send_report(fd, "wifi", "failed",
                         result.error_code == 0 ? 4101 : result.error_code,
