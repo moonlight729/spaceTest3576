@@ -8,7 +8,7 @@ static const char g_spacetest_version[] __attribute__((used)) = SPACETEST_VERSIO
 void app_config_load_defaults(struct app_config *config)
 {
     const char *keys_timeout_ms;
-    config->bind_address = "127.0.0.1";
+    config->bind_address = "0.0.0.0";
     config->port = 19001;
     config->board_state_path = "/userdata/factory_test/spacetest3576_board_state.txt";
     config->wifi_ssid = "originflow";

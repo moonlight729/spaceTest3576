@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -43,6 +44,8 @@ int main(void)
 {
     struct app_config config;
     int listener;
+    /* A client timeout must only fail that request, never terminate the PCBA service. */
+    signal(SIGPIPE, SIG_IGN);
     app_config_load_defaults(&config);
     if (usb_pretest_start(&config) != 0) {
         fprintf(stderr, "usb pretest worker failed to start\n");

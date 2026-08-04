@@ -4,13 +4,267 @@
 #include "../protocol/protocol.h"
 #include "../storage/board_state.h"
 #include "../tests/test_runner.h"
+#include "../hardware/pressure/pressure_stress.h"
+#include "../hardware/wifi/wifi_nmcli.h"
+#include "../hardware/ethernet/ethernet_nmcli.h"
+#include "../hardware/bluetooth/bluetoothctl_scan.h"
+#include "../hardware/pressure/pressure_peripheral.h"
+#include "../hardware/camera/camera_stream.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/select.h>
+#include <time.h>
+
+static pid_t pressure_cpu_pid = -1;
+static pid_t pressure_memory_pid = -1;
+static time_t pressure_load_started_at = 0;
+static int pressure_load_error_count = 0;
 
 static int send_failure(int fd, const char *session_id, int code, const char *message);
 static int send_ok_response(int fd, const char *session_id, const char *message);
+
+struct pressure_worker_args { int is_cpu; struct pressure_stress_result *result; int rc; };
+static void *run_pressure_worker(void *argument)
+{
+    struct pressure_worker_args *args = argument;
+    args->rc = args->is_cpu ? pressure_run_cpu(4, 60, args->result) : pressure_run_memory(512, 60, args->result);
+    return NULL;
+}
+
+static int handle_pressure_start(int fd, const struct protocol_request *request)
+{
+    struct pressure_stress_result cpu = {0};
+    struct pressure_stress_result memory = {0};
+    char data[256];
+    char line[512];
+    struct pressure_worker_args cpu_args = { .is_cpu = 1, .result = &cpu, .rc = -1 };
+    struct pressure_worker_args memory_args = { .is_cpu = 0, .result = &memory, .rc = -1 };
+    pthread_t cpu_thread;
+    pthread_t memory_thread;
+    int cpu_rc;
+    int memory_rc;
+    if (pthread_create(&cpu_thread, NULL, run_pressure_worker, &cpu_args) != 0 ||
+        pthread_create(&memory_thread, NULL, run_pressure_worker, &memory_args) != 0) {
+        return send_failure(fd, request->session_id, 6002, "Unable to start CPU/memory pressure workers");
+    }
+    pthread_join(cpu_thread, NULL);
+    pthread_join(memory_thread, NULL);
+    cpu_rc = cpu_args.rc;
+    memory_rc = memory_args.rc;
+    snprintf(data, sizeof(data), "{\"cpu\":{\"exitCode\":%d,\"durationSec\":%d,\"errorCount\":%d},\"memory\":{\"exitCode\":%d,\"durationSec\":%d,\"errorCount\":%d}}", cpu.exit_code, cpu.duration_sec, cpu.error_count, memory.exit_code, memory.duration_sec, memory.error_count);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, cpu_rc == 0 && memory_rc == 0 ? 0 : 6001, cpu_rc == 0 && memory_rc == 0 ? "Pressure CPU and memory run completed" : "Pressure CPU or memory run failed", data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_metric(int fd, const struct protocol_request *request, int is_cpu)
+{
+    struct pressure_stress_result result = {0};
+    char data[192]; char line[448];
+    int rc = is_cpu ? pressure_run_cpu(4, 60, &result) : pressure_run_memory(512, 60, &result);
+    snprintf(data, sizeof(data), "{\"exitCode\":%d,\"durationSec\":%d,\"errorCount\":%d}", result.exit_code, result.duration_sec, result.error_count);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : 6001,
+        rc == 0 ? (is_cpu ? "CPU pressure completed" : "Memory pressure completed") : "Pressure metric failed", data);
+    return protocol_write_line(fd, line);
+}
+
+static int pressure_worker_alive(pid_t *pid)
+{
+    int status;
+    if (*pid <= 0) return 0;
+    if (waitpid(*pid, &status, WNOHANG) == *pid) {
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) pressure_load_error_count++;
+        *pid = -1;
+        return 0;
+    }
+    return kill(*pid, 0) == 0;
+}
+
+static pid_t start_pressure_process(const char *command)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int send_pressure_load_status(int fd, const struct protocol_request *request, const char *message)
+{
+    int cpu_alive = pressure_worker_alive(&pressure_cpu_pid);
+    int memory_alive = pressure_worker_alive(&pressure_memory_pid);
+    int running = cpu_alive && memory_alive;
+    long elapsed = pressure_load_started_at == 0 ? 0 : (long)(time(NULL) - pressure_load_started_at);
+    char data[384]; char line[640];
+    snprintf(data, sizeof(data), "{\"running\":%s,\"elapsedSec\":%ld,\"cpuWorkers\":4,\"memoryMiB\":512,\"errorCount\":%d,\"detail\":\"cpu=%s,memory=%s\"}",
+        running ? "true" : "false", elapsed, pressure_load_error_count, cpu_alive ? "running" : "stopped", memory_alive ? "running" : "stopped");
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, running || pressure_load_started_at == 0 ? 0 : 6003, message, data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_load_start(int fd, const struct protocol_request *request)
+{
+    if (!pressure_worker_alive(&pressure_cpu_pid)) pressure_cpu_pid = start_pressure_process("exec stress-ng --cpu 4 --metrics-brief >/dev/null 2>&1");
+    if (!pressure_worker_alive(&pressure_memory_pid)) pressure_memory_pid = start_pressure_process("exec stress-ng --vm 1 --vm-bytes 512M --vm-keep --metrics-brief >/dev/null 2>&1");
+    if (pressure_cpu_pid <= 0 || pressure_memory_pid <= 0) return send_failure(fd, request->session_id, 6002, "Unable to start persistent CPU/memory pressure workers");
+    pressure_load_started_at = time(NULL);
+    pressure_load_error_count = 0;
+    return send_pressure_load_status(fd, request, "Persistent CPU/memory pressure started");
+}
+
+static int handle_pressure_load_stop(int fd, const struct protocol_request *request)
+{
+    if (pressure_cpu_pid > 0) kill(pressure_cpu_pid, SIGTERM);
+    if (pressure_memory_pid > 0) kill(pressure_memory_pid, SIGTERM);
+    pressure_cpu_pid = -1; pressure_memory_pid = -1;
+    return send_pressure_load_status(fd, request, "Persistent CPU/memory pressure stopped");
+}
+
+static int handle_pressure_wifi(int fd, const struct protocol_request *request, const struct app_config *config)
+{
+    struct wifi_device device;
+    struct wifi_result result = {0};
+    struct wifi_request scan = { .ssid = config->wifi_ssid, .scan_timeout_ms = 10000 };
+    char data[512];
+    char line[768];
+    int rc;
+    result.rssi = -127;
+    if (wifi_nmcli_open(&device, NULL) != 0) return send_failure(fd, request->session_id, 6101, "Unable to open Wi-Fi interface");
+    rc = wifi_nmcli_scan_signal(&device, &scan, &result);
+    snprintf(data, sizeof(data), "{\"interfaceName\":\"%s\",\"found\":%s,\"rssi\":%d,\"scanRetryCount\":%d,\"failureReason\":\"%s\"}",
+             device.interface_name, result.found ? "true" : "false", result.rssi, result.scan_retry_count, result.failure_reason);
+    wifi_nmcli_close(&device);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id,
+        rc == 0 && result.found ? 0 : (result.error_code == 0 ? 6102 : result.error_code),
+        rc == 0 && result.found ? "Wi-Fi pressure scan completed" : result.error_message, data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_ethernet(int fd, const struct protocol_request *request, const struct app_config *config)
+{
+    struct ethernet_request test = { .interface_name = "end0", .router_ip = config->wifi_router_ip, .ping_count = 4, .timeout_ms = 15000 };
+    struct ethernet_result result = {0};
+    char data[512];
+    char line[768];
+    int rc = ethernet_nmcli_run_test(&test, &result);
+    snprintf(data, sizeof(data), "{\"interfaceName\":\"%s\",\"ip\":\"%s\",\"routerIp\":\"%s\",\"linkUp\":%s,\"ipAcquired\":%s,\"pingOk\":%s,\"pingCount\":%d,\"avgDelayMs\":%d,\"failureReason\":\"%s\"}",
+             result.interface_name, result.ip, result.router_ip, result.link_up ? "true" : "false", result.ip_acquired ? "true" : "false", result.ping_ok ? "true" : "false", result.completed_ping_count, result.avg_delay_ms, result.failure_reason);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : (result.error_code == 0 ? 6201 : result.error_code), rc == 0 ? "Ethernet pressure check completed" : result.message, data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_bluetooth(int fd, const struct protocol_request *request, const struct app_config *config)
+{
+    struct bluetooth_request scan = { .target_name = config->bluetooth_target_name, .timeout_ms = 10000, .min_rssi = config->bluetooth_min_rssi };
+    struct bluetooth_result result = {0};
+    char data[512];
+    char line[768];
+    int rc = bluetoothctl_scan_target(&scan, &result);
+    snprintf(data, sizeof(data), "{\"found\":%s,\"name\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"failureReason\":\"%s\"}",
+             result.found ? "true" : "false", result.name, result.mac, result.rssi, result.failure_reason);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : (result.error_code == 0 ? 6301 : result.error_code), rc == 0 ? "Bluetooth pressure scan completed" : result.error_message, data);
+    return protocol_write_line(fd, line);
+}
+
+/* USB media and kernel drivers can fail independently.  Do not allow a fault in that
+ * path to terminate the TCP service (and with it the continuous CPU/memory workers). */
+struct usb_pressure_worker_response { int rc; struct pressure_peripheral_result result; };
+static int pressure_check_usb_isolated(struct pressure_peripheral_result *result)
+{
+    int pipe_fd[2]; pid_t pid; struct usb_pressure_worker_response response; fd_set readable;
+    struct timeval timeout = { .tv_sec = 30, .tv_usec = 0 };
+    ssize_t received;
+    if (pipe(pipe_fd) != 0) return -1;
+    pid = fork();
+    if (pid == 0) {
+        ssize_t written;
+        close(pipe_fd[0]);
+        memset(&response, 0, sizeof(response));
+        response.rc = pressure_check_usb_storage(&response.result);
+        written = write(pipe_fd[1], &response, sizeof(response));
+        close(pipe_fd[1]);
+        _exit(written == (ssize_t)sizeof(response) ? 0 : 1);
+    }
+    close(pipe_fd[1]);
+    if (pid < 0) { close(pipe_fd[0]); return -1; }
+    FD_ZERO(&readable); FD_SET(pipe_fd[0], &readable);
+    if (select(pipe_fd[0] + 1, &readable, NULL, NULL, &timeout) <= 0) {
+        kill(pid, SIGKILL); waitpid(pid, NULL, 0); close(pipe_fd[0]);
+        memset(result, 0, sizeof(*result)); result->error_code = 6605;
+        snprintf(result->detail, sizeof(result->detail), "USB pressure worker timed out");
+        return -1;
+    }
+    received = read(pipe_fd[0], &response, sizeof(response));
+    close(pipe_fd[0]); waitpid(pid, NULL, 0);
+    if (received != (ssize_t)sizeof(response)) {
+        memset(result, 0, sizeof(*result)); result->error_code = 6606;
+        snprintf(result->detail, sizeof(result->detail), "USB pressure worker exited unexpectedly");
+        return -1;
+    }
+    *result = response.result;
+    return response.rc;
+}
+
+static int handle_pressure_peripheral(int fd, const struct protocol_request *request, const char *item_id)
+{
+    struct pressure_peripheral_result result;
+    char data[320];
+    char line[512];
+    int rc = strcmp(item_id, "fan") == 0
+        ? pressure_check_fan("/sys/class/hwmon/hwmon12/pwm1", "/sys/class/hwmon/hwmon12/tach_rpm", &result)
+        : strcmp(item_id, "hdmi") == 0 ? pressure_check_hdmi(&result) : pressure_check_usb_isolated(&result);
+    snprintf(data, sizeof(data), "{\"value\":%d,\"active\":%s,\"detail\":\"%s\"}", result.value, result.active ? "true" : "false", result.detail);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : result.error_code,
+        rc == 0 ? "Pressure peripheral check completed" : result.detail, data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_storage(int fd, const struct protocol_request *request, const struct app_config *config, const char *item_id)
+{
+    struct pressure_peripheral_result result;
+    char data[320]; char line[512];
+    const char *directory = strcmp(item_id, "emmc") == 0 ? "/userdata/factory_test" : config->tf_mount_point;
+    int rc = pressure_check_file_storage(directory, strcmp(item_id, "emmc") == 0 ? "eMMC" : "TF", &result);
+    snprintf(data, sizeof(data), "{\"value\":%d,\"active\":%s,\"detail\":\"%s\"}", result.value, result.active ? "true" : "false", result.detail);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : result.error_code, rc == 0 ? "Pressure storage check completed" : result.detail, data);
+    return protocol_write_line(fd, line);
+}
+
+static int handle_pressure_camera(int fd, const struct protocol_request *request, const struct app_config *config)
+{
+    struct camera_stream_request camera_request = {
+        .device_path = config->camera_device_path,
+        .stream_frame_count = 1800,
+        .timeout_ms = 3000,
+        .require_exposure_interrupt = 0,
+        .exposure_counter_path = NULL,
+        .exposure_frame_count = 0,
+        .require_pwm_pulse = 0,
+        .pwm_status_path = NULL,
+        .pwm_min_pulse_delta = 0
+    };
+    struct camera_stream_result result;
+    struct timespec started; struct timespec ended;
+    long elapsed_ms; int fps; char data[512]; char line[768]; int rc;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    rc = camera_stream_run_test(&camera_request, &result);
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    elapsed_ms = (ended.tv_sec - started.tv_sec) * 1000L + (ended.tv_nsec - started.tv_nsec) / 1000000L;
+    if (elapsed_ms < 1) elapsed_ms = 1;
+    fps = result.captured_frames * 1000 / (int)elapsed_ms;
+    snprintf(data, sizeof(data), "{\"value\":%d,\"active\":%s,\"detail\":\"%.180s\",\"device\":\"%.100s\",\"capturedFrames\":%d,\"durationMs\":%ld,\"fps\":%d,\"frameTimeoutCount\":%d}",
+             result.captured_frames, rc == 0 && result.stream_ok ? "true" : "false",
+             result.message, result.device_path, result.captured_frames, elapsed_ms, fps, rc == 0 ? 0 : 1);
+    protocol_build_response_envelope(line, sizeof(line), request->session_id, rc == 0 ? 0 : (result.error_code == 0 ? 6801 : result.error_code),
+        rc == 0 ? "USB camera pressure stream completed" : result.message, data);
+    return protocol_write_line(fd, line);
+}
 
 static int send_application_md5(int fd, const char *session_id, const struct app_config *config)
 {
@@ -186,5 +440,31 @@ int session_manager_handle_client(int client_fd, const struct app_config *config
     }
     if (strcmp(request.command_group, "session") == 0 && strcmp(request.command, "start") == 0)
         return test_runner_run_plan(client_fd, request.session_id, line, config);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "start") == 0)
+        return handle_pressure_start(client_fd, &request);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "cpu") == 0)
+        return handle_pressure_metric(client_fd, &request, 1);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "memory") == 0)
+        return handle_pressure_metric(client_fd, &request, 0);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "load_start") == 0)
+        return handle_pressure_load_start(client_fd, &request);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "load_status") == 0)
+        return send_pressure_load_status(client_fd, &request, "Persistent CPU/memory pressure status");
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "load_stop") == 0)
+        return handle_pressure_load_stop(client_fd, &request);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "wifi") == 0)
+        return handle_pressure_wifi(client_fd, &request, config);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "ethernet") == 0)
+        return handle_pressure_ethernet(client_fd, &request, config);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "bluetooth") == 0)
+        return handle_pressure_bluetooth(client_fd, &request, config);
+    if (strcmp(request.command_group, "pressure") == 0 && (strcmp(request.command, "fan") == 0 || strcmp(request.command, "hdmi") == 0))
+        return handle_pressure_peripheral(client_fd, &request, request.command);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "usb") == 0)
+        return handle_pressure_peripheral(client_fd, &request, request.command);
+    if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "camera") == 0)
+        return handle_pressure_camera(client_fd, &request, config);
+    if (strcmp(request.command_group, "pressure") == 0 && (strcmp(request.command, "emmc") == 0 || strcmp(request.command, "tf") == 0))
+        return handle_pressure_storage(client_fd, &request, config, request.command);
     return send_failure(client_fd, request.session_id, 1002, "Unsupported command");
 }
