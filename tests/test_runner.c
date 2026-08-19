@@ -19,7 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,6 +33,7 @@
 #define PMIC_STATUS1_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1c r1"
 
 static int wait_test_decision(int fd, const char *test_id, int timeout_ms, int *passed);
+static int wait_operator_decision_or_disconnect(int fd, const char *test_id, int timeout_ms, int *passed, int *disconnected);
 
 static const char *find_object_end(const char *start)
 {
@@ -191,6 +194,16 @@ static void sleep_ms_local(int ms)
     nanosleep(&ts, NULL);
 }
 
+static double timespec_diff_ms(const struct timespec *start, const struct timespec *end)
+{
+    double seconds;
+    double nanoseconds;
+    if (start == NULL || end == NULL) return 0.0;
+    seconds = (double)(end->tv_sec - start->tv_sec) * 1000.0;
+    nanoseconds = (double)(end->tv_nsec - start->tv_nsec) / 1000000.0;
+    return seconds + nanoseconds;
+}
+
 static int any_camera_device_present(void)
 {
     int index;
@@ -324,7 +337,7 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     int retry_interval_ms = 2000;
     int decision_timeout_ms = 5000;
     int scan_timeout_ms = 10000;
-    int min_rssi = -75;
+    int min_rssi = -55;
     int attempt;
     struct wifi_request request = {
         .ssid = ssid,
@@ -570,7 +583,7 @@ static int run_tf_card(int fd, const struct app_config *config, const char *test
     return send_report(fd, "tf", "passed", 0, result.message, data);
 }
 
-static int run_usb_variant(int fd, const char *test_start, const char *test_end, int usb_version)
+static int run_usb2_3(int fd, const char *test_start, const char *test_end)
 {
     char record_file[160] = "/tmp/spacetest_usb_ports.json";
     char test_mode[32] = "pcba";
@@ -584,30 +597,24 @@ static int run_usb_variant(int fd, const char *test_start, const char *test_end,
              strcmp(test_mode, "finished_product") == 0 ? "finished_product" : "pcba");
 
     snprintf(data, sizeof(data),
-             "{\"recordFile\":\"%s\",\"mode\":\"%s\",\"usbVersion\":\"usb%d\",\"requiredCycles\":4}", record_file, test_mode, usb_version);
-    send_report(fd, usb_version == 2 ? "usb2" : "usb3", "running", 0, usb_version == 2 ? "Read USB2.0 connectivity pretest result" : "Read USB3.0 connectivity pretest result", data);
+             "{\"recordFile\":\"%s\",\"mode\":\"%s\",\"requiredUsb2Cycles\":4,\"requiredUsb3Cycles\":4}", record_file, test_mode);
+    send_report(fd, "usb2_3", "running", 0, "Read USB connectivity pretest result", data);
     file = fopen(record_file, "r");
     if (file == NULL || fgets(content, sizeof(content), file) == NULL) {
         if (file != NULL) fclose(file);
-        send_report(fd, usb_version == 2 ? "usb2" : "usb3", "failed", 4901, "USB pretest result file not found", data);
+        send_report(fd, "usb2_3", "failed", 4901, "USB pretest result file not found", data);
         return -1;
     }
     fclose(file);
     if (strstr(content, "\"overallResult\":\"passed\"") == NULL ||
-        (usb_version == 2 ? strstr(content, "\"usb2Cycles\":4") == NULL : strstr(content, "\"usb3Cycles\":4") == NULL) ||
+        strstr(content, "\"usb2Cycles\":4") == NULL ||
+        strstr(content, "\"usb3Cycles\":4") == NULL ||
         (strcmp(test_mode, "finished_product") == 0 && strstr(content, "\"testMode\":\"finished_product\"") == NULL) ||
         (strcmp(test_mode, "finished_product") != 0 && strstr(content, "\"testMode\":\"pcba\"") == NULL)) {
-        send_report(fd, usb_version == 2 ? "usb2" : "usb3", "failed", 4902, "USB pretest connectivity result failed or mode mismatch", data);
+        send_report(fd, "usb2_3", "failed", 4902, "USB pretest connectivity result failed or mode mismatch", data);
         return -1;
     }
-    return send_report(fd, usb_version == 2 ? "usb2" : "usb3", "passed", 0, usb_version == 2 ? "USB2.0 connectivity pretest passed" : "USB3.0 connectivity pretest passed", data);
-}
-
-static int run_usb2_3(int fd, const char *test_start, const char *test_end)
-{
-    int rc = run_usb_variant(fd, test_start, test_end, 2);
-    if (rc != 0) return rc;
-    return run_usb_variant(fd, test_start, test_end, 3);
+    return send_report(fd, "usb2_3", "passed", 0, "USB2.0 and USB3.0 connectivity pretest passed", data);
 }
 
 static void append_pcba_points_json(char *data, size_t data_size,
@@ -678,6 +685,334 @@ static int run_pcba_test_points(int fd, const char *test_start, const char *test
 
     append_pcba_points_json(data, sizeof(data), &result, 1);
     return send_report(fd, "pcba_test_points", "passed", 0, result.message, data);
+}
+
+static int read_text_file_trimmed(const char *path, char *buffer, size_t buffer_size)
+{
+    FILE *file;
+    size_t length;
+    if (path == NULL || buffer == NULL || buffer_size == 0) return -1;
+    buffer[0] = '\0';
+    file = fopen(path, "r");
+    if (file == NULL) return -1;
+    if (fgets(buffer, (int)buffer_size, file) == NULL) {
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    length = strcspn(buffer, "\r\n");
+    buffer[length] = '\0';
+    return buffer[0] == '\0' ? -1 : 0;
+}
+
+static int read_ull_file(const char *path, unsigned long long *value)
+{
+    FILE *file;
+    unsigned long long parsed;
+    if (path == NULL || value == NULL) return -1;
+    file = fopen(path, "r");
+    if (file == NULL) return -1;
+    if (fscanf(file, "%llu", &parsed) != 1) {
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    *value = parsed;
+    return 0;
+}
+
+static unsigned char emmc_test_byte(unsigned long long offset)
+{
+    return (unsigned char)(((offset * 31ULL) + 17ULL) & 0xFFULL);
+}
+
+static int ensure_directory_for_test(const char *path)
+{
+    struct stat st;
+    if (path == NULL || path[0] == '\0') return -1;
+    if (stat(path, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -1;
+    return mkdir(path, 0775);
+}
+
+static int run_emmc_file_pattern_test(const char *directory, int file_mib,
+                                      char *test_file, size_t test_file_size,
+                                      char *failure_reason, size_t failure_reason_size)
+{
+    const size_t chunk_size = 1024U * 1024U;
+    unsigned char *buffer;
+    int fd;
+    int chunk;
+    int total_chunks;
+    ssize_t io_count;
+    size_t i;
+    unsigned long long base_offset;
+
+    if (test_file == NULL || test_file_size == 0 || failure_reason == NULL || failure_reason_size == 0) return -1;
+    test_file[0] = '\0';
+    failure_reason[0] = '\0';
+    if (file_mib <= 0) file_mib = 64;
+    if (file_mib > 512) file_mib = 512;
+    if (ensure_directory_for_test(directory) != 0) {
+        snprintf(failure_reason, failure_reason_size, "emmc_test_directory_unavailable");
+        return -1;
+    }
+    snprintf(test_file, test_file_size, "%s/spacetest_emmc_ddr_rw.bin", directory);
+    buffer = (unsigned char *)malloc(chunk_size);
+    if (buffer == NULL) {
+        snprintf(failure_reason, failure_reason_size, "emmc_buffer_allocate_failed");
+        return -1;
+    }
+
+    fd = open(test_file, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0664);
+    if (fd < 0) {
+        free(buffer);
+        snprintf(failure_reason, failure_reason_size, "emmc_open_failed");
+        return -1;
+    }
+
+    total_chunks = file_mib;
+    for (chunk = 0; chunk < total_chunks; ++chunk) {
+        base_offset = (unsigned long long)chunk * (unsigned long long)chunk_size;
+        for (i = 0; i < chunk_size; ++i) buffer[i] = emmc_test_byte(base_offset + (unsigned long long)i);
+        io_count = write(fd, buffer, chunk_size);
+        if (io_count != (ssize_t)chunk_size) {
+            close(fd);
+            unlink(test_file);
+            free(buffer);
+            snprintf(failure_reason, failure_reason_size, "emmc_write_failed");
+            return -1;
+        }
+    }
+    if (fsync(fd) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        unlink(test_file);
+        free(buffer);
+        snprintf(failure_reason, failure_reason_size, "emmc_sync_or_seek_failed");
+        return -1;
+    }
+
+    for (chunk = 0; chunk < total_chunks; ++chunk) {
+        base_offset = (unsigned long long)chunk * (unsigned long long)chunk_size;
+        io_count = read(fd, buffer, chunk_size);
+        if (io_count != (ssize_t)chunk_size) {
+            close(fd);
+            unlink(test_file);
+            free(buffer);
+            snprintf(failure_reason, failure_reason_size, "emmc_read_failed");
+            return -1;
+        }
+        for (i = 0; i < chunk_size; ++i) {
+            if (buffer[i] != emmc_test_byte(base_offset + (unsigned long long)i)) {
+                close(fd);
+                unlink(test_file);
+                free(buffer);
+                snprintf(failure_reason, failure_reason_size, "emmc_verify_failed");
+                return -1;
+            }
+        }
+    }
+
+    close(fd);
+    if (unlink(test_file) != 0) {
+        free(buffer);
+        snprintf(failure_reason, failure_reason_size, "emmc_cleanup_failed");
+        return -1;
+    }
+    free(buffer);
+    return 0;
+}
+
+static int read_memtotal_mib(unsigned long long *memtotal_mib)
+{
+    FILE *file;
+    char key[64];
+    unsigned long long kb;
+    char unit[32];
+    if (memtotal_mib == NULL) return -1;
+    file = fopen("/proc/meminfo", "r");
+    if (file == NULL) return -1;
+    while (fscanf(file, "%63s %llu %31s", key, &kb, unit) == 3) {
+        if (strcmp(key, "MemTotal:") == 0) {
+            fclose(file);
+            *memtotal_mib = kb / 1024ULL;
+            return 0;
+        }
+    }
+    fclose(file);
+    return -1;
+}
+
+static int run_ddr_pattern_test(int stress_mib, int loops, char *failure_reason, size_t failure_reason_size)
+{
+    size_t total_bytes;
+    uint32_t *words;
+    size_t word_count;
+    int loop;
+    int pattern_index;
+    static const uint32_t patterns[] = { 0x00000000U, 0xFFFFFFFFU, 0xAA55AA55U, 0x55AA55AAU };
+    size_t i;
+    uint32_t expected;
+
+    if (failure_reason == NULL || failure_reason_size == 0) return -1;
+    failure_reason[0] = '\0';
+    if (stress_mib <= 0) stress_mib = 256;
+    if (stress_mib > 1024) stress_mib = 1024;
+    if (loops <= 0) loops = 2;
+    if (loops > 10) loops = 10;
+    total_bytes = (size_t)stress_mib * 1024U * 1024U;
+    words = (uint32_t *)malloc(total_bytes);
+    if (words == NULL) {
+        snprintf(failure_reason, failure_reason_size, "ddr_allocate_failed");
+        return -1;
+    }
+    word_count = total_bytes / sizeof(uint32_t);
+
+    for (loop = 0; loop < loops; ++loop) {
+        for (pattern_index = 0; pattern_index < (int)(sizeof(patterns) / sizeof(patterns[0])); ++pattern_index) {
+            for (i = 0; i < word_count; ++i) words[i] = patterns[pattern_index] ^ (uint32_t)i;
+            for (i = 0; i < word_count; ++i) {
+                expected = patterns[pattern_index] ^ (uint32_t)i;
+                if (words[i] != expected) {
+                    free(words);
+                    snprintf(failure_reason, failure_reason_size, "ddr_pattern_mismatch");
+                    return -1;
+                }
+            }
+        }
+    }
+
+    free(words);
+    return 0;
+}
+
+static int run_emmc_ddr(int fd, const char *test_id, const char *test_start, const char *test_end)
+{
+    char emmc_device[64] = "mmcblk0";
+    char emmc_test_dir[160] = "/userdata/factory_test";
+    char path[192];
+    char emmc_name[128] = "";
+    char emmc_cid[256] = "";
+    char emmc_manfid[64] = "";
+    char emmc_test_file[192] = "";
+    char failure_reason[96] = "";
+    char data[2048];
+    unsigned long long emmc_sectors = 0;
+    unsigned long long emmc_capacity_mib = 0;
+    unsigned long long emmc_min_capacity_mib = 115ULL * 1024ULL;
+    int emmc_test_file_mib = 64;
+    unsigned long long ddr_memtotal_mib = 0;
+    int ddr_min_memtotal_mib = 3200;
+    int ddr_stress_mib = 256;
+    int ddr_stress_loops = 2;
+    struct timespec ddr_start_ts;
+    struct timespec ddr_end_ts;
+    double ddr_elapsed_ms = 0.0;
+    double ddr_throughput_mib_per_sec = 0.0;
+    unsigned long long ddr_processed_mib = 0;
+
+    param_string(test_start, test_end, "emmcDevice", emmc_device, sizeof(emmc_device));
+    param_string(test_start, test_end, "emmcTestDirectory", emmc_test_dir, sizeof(emmc_test_dir));
+    emmc_min_capacity_mib = (unsigned long long)param_int(test_start, test_end, "emmcMinCapacityGiB", 115) * 1024ULL;
+    emmc_test_file_mib = param_int(test_start, test_end, "emmcTestFileMiB", emmc_test_file_mib);
+    ddr_min_memtotal_mib = param_int(test_start, test_end, "ddrMinMemTotalMiB", ddr_min_memtotal_mib);
+    ddr_stress_mib = param_int(test_start, test_end, "ddrStressMiB", ddr_stress_mib);
+    ddr_stress_loops = param_int(test_start, test_end, "ddrStressLoops", ddr_stress_loops);
+
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"start\",\"emmcDevice\":\"%s\",\"emmcMinCapacityMiB\":%llu,"
+             "\"emmcTestFileMiB\":%d,\"ddrMinMemTotalMiB\":%d,\"ddrStressMiB\":%d,\"ddrStressLoops\":%d}",
+             emmc_device, emmc_min_capacity_mib, emmc_test_file_mib,
+             ddr_min_memtotal_mib, ddr_stress_mib, ddr_stress_loops);
+    send_report(fd, test_id, "running", 0, strcmp(test_id, "emmc") == 0 ? "Running eMMC device test" : "Running DDR device test", data);
+
+    if (strcmp(test_id, "ddr") == 0) goto ddr_start;
+
+    snprintf(path, sizeof(path), "/sys/block/%s/size", emmc_device);
+    if (read_ull_file(path, &emmc_sectors) != 0) {
+        snprintf(data, sizeof(data), "{\"phase\":\"emmc_info\",\"emmcDevice\":\"%s\",\"failureReason\":\"emmc_device_not_found\"}", emmc_device);
+        send_report(fd, test_id, "failed", 5101, "eMMC block device was not found", data);
+        return -1;
+    }
+    emmc_capacity_mib = emmc_sectors / 2048ULL;
+    snprintf(path, sizeof(path), "/sys/block/%s/device/name", emmc_device);
+    (void)read_text_file_trimmed(path, emmc_name, sizeof(emmc_name));
+    snprintf(path, sizeof(path), "/sys/block/%s/device/cid", emmc_device);
+    (void)read_text_file_trimmed(path, emmc_cid, sizeof(emmc_cid));
+    snprintf(path, sizeof(path), "/sys/block/%s/device/manfid", emmc_device);
+    (void)read_text_file_trimmed(path, emmc_manfid, sizeof(emmc_manfid));
+
+    if (emmc_capacity_mib < emmc_min_capacity_mib) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"emmc_capacity\",\"emmcDevice\":\"%s\",\"emmcName\":\"%s\",\"emmcCid\":\"%s\","
+                 "\"emmcManfid\":\"%s\",\"emmcCapacityMiB\":%llu,\"emmcMinCapacityMiB\":%llu,"
+                 "\"failureReason\":\"emmc_capacity_too_small\"}",
+                 emmc_device, emmc_name, emmc_cid, emmc_manfid, emmc_capacity_mib, emmc_min_capacity_mib);
+        send_report(fd, test_id, "failed", 5102, "eMMC capacity is below threshold", data);
+        return -1;
+    }
+
+    if (run_emmc_file_pattern_test(emmc_test_dir, emmc_test_file_mib,
+                                   emmc_test_file, sizeof(emmc_test_file),
+                                   failure_reason, sizeof(failure_reason)) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"emmc_rw\",\"emmcDevice\":\"%s\",\"emmcName\":\"%s\",\"emmcCapacityMiB\":%llu,"
+                 "\"emmcTestFile\":\"%s\",\"emmcTestFileMiB\":%d,\"failureReason\":\"%s\"}",
+                 emmc_device, emmc_name, emmc_capacity_mib, emmc_test_file, emmc_test_file_mib, failure_reason);
+        send_report(fd, test_id, "failed", 5103, "eMMC read/write verify failed", data);
+        return -1;
+    }
+
+    if (strcmp(test_id, "emmc") == 0) {
+        snprintf(data, sizeof(data), "{\"phase\":\"completed\",\"emmcDevice\":\"%s\",\"emmcName\":\"%s\",\"emmcCapacityMiB\":%llu,\"emmcTestFileMiB\":%d}", emmc_device, emmc_name, emmc_capacity_mib, emmc_test_file_mib);
+        return send_report(fd, test_id, "passed", 0, "eMMC device test passed", data);
+    }
+
+ddr_start:
+    if (read_memtotal_mib(&ddr_memtotal_mib) != 0) {
+        snprintf(data, sizeof(data), "{\"phase\":\"ddr_info\",\"failureReason\":\"ddr_meminfo_unavailable\"}");
+        send_report(fd, test_id, "failed", 5111, "DDR memory information is unavailable", data);
+        return -1;
+    }
+    if (ddr_memtotal_mib < (unsigned long long)ddr_min_memtotal_mib) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"ddr_capacity\",\"ddrMemTotalMiB\":%llu,\"ddrMinMemTotalMiB\":%d,"
+                 "\"failureReason\":\"ddr_capacity_too_small\"}",
+                 ddr_memtotal_mib, ddr_min_memtotal_mib);
+        send_report(fd, test_id, "failed", 5112, "DDR capacity is below threshold", data);
+        return -1;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ddr_start_ts) != 0) {
+        ddr_start_ts.tv_sec = 0;
+        ddr_start_ts.tv_nsec = 0;
+    }
+    if (run_ddr_pattern_test(ddr_stress_mib, ddr_stress_loops, failure_reason, sizeof(failure_reason)) != 0) {
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"ddr_stress\",\"ddrMemTotalMiB\":%llu,\"ddrStressMiB\":%d,"
+                 "\"ddrStressLoops\":%d,\"failureReason\":\"%s\"}",
+                 ddr_memtotal_mib, ddr_stress_mib, ddr_stress_loops, failure_reason);
+        send_report(fd, test_id, "failed", 5113, "DDR pattern stress test failed", data);
+        return -1;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &ddr_end_ts) == 0 && ddr_start_ts.tv_sec != 0) {
+        ddr_elapsed_ms = timespec_diff_ms(&ddr_start_ts, &ddr_end_ts);
+        ddr_processed_mib = (unsigned long long)ddr_stress_mib * (unsigned long long)ddr_stress_loops * 8ULL;
+        if (ddr_elapsed_ms > 0.0) {
+            ddr_throughput_mib_per_sec = ((double)ddr_processed_mib * 1000.0) / ddr_elapsed_ms;
+        }
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"completed\",\"emmcDevice\":\"%s\",\"emmcName\":\"%s\",\"emmcCid\":\"%s\","
+             "\"emmcManfid\":\"%s\",\"emmcCapacityMiB\":%llu,\"emmcMinCapacityMiB\":%llu,"
+             "\"emmcTestFileMiB\":%d,\"ddrMemTotalMiB\":%llu,\"ddrMinMemTotalMiB\":%d,"
+             "\"ddrStressMiB\":%d,\"ddrStressLoops\":%d,\"ddrProcessedMiB\":%llu,"
+             "\"ddrElapsedMs\":%.2f,\"ddrThroughputMiBPerSec\":%.2f,\"ddrPatternPass\":true}",
+             emmc_device, emmc_name, emmc_cid, emmc_manfid,
+             emmc_capacity_mib, emmc_min_capacity_mib, emmc_test_file_mib,
+             ddr_memtotal_mib, ddr_min_memtotal_mib, ddr_stress_mib, ddr_stress_loops,
+             ddr_processed_mib, ddr_elapsed_ms, ddr_throughput_mib_per_sec);
+    return send_report(fd, test_id, "passed", 0, "DDR device test passed", data);
 }
 
 static int run_bluetooth(int fd, const struct app_config *config, const char *test_start, const char *test_end)
@@ -1279,6 +1614,43 @@ static int run_manual_observation(int fd, const char *test_id, const char *displ
     }
 }
 
+static int wait_operator_decision_or_disconnect(int fd, const char *test_id, int timeout_ms, int *passed, int *disconnected)
+{
+    struct timespec start, now;
+    char line[PROTOCOL_MAX_LINE];
+
+    if (passed == NULL || disconnected == NULL) return -1;
+    *passed = 0;
+    *disconnected = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        int remaining;
+        fd_set read_fds;
+        struct timeval tv;
+        int ready;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining = timeout_ms - elapsed_ms(&start, &now);
+        if (remaining <= 0) return 0;
+
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        tv.tv_sec = remaining / 1000;
+        tv.tv_usec = (remaining % 1000) * 1000;
+        ready = select(fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ready < 0) return -1;
+        if (ready == 0) return 0;
+        if (protocol_read_line(fd, line, sizeof(line)) <= 0) {
+            *disconnected = 1;
+            return 2;
+        }
+        if (strstr(line, "\"event\":\"operator.decision\"") == NULL) continue;
+        if (strstr(line, test_id) == NULL) continue;
+        *passed = strstr(line, "\"passed\":true") != NULL;
+        return 1;
+    }
+}
+
 static int write_fan_pwm(const char *path, int value)
 {
     char text[32];
@@ -1306,6 +1678,30 @@ static int read_fan_tach(const char *path, int *value)
     return scanned == 1 ? 0 : -1;
 }
 
+static int read_fan_tach_stable(const char *path, int sample_count, int interval_ms,
+                                int *last_value, int *running_seen, int *samples_read)
+{
+    int index;
+    int value = 0;
+    if (last_value == NULL || running_seen == NULL || samples_read == NULL) return -1;
+    *last_value = 0;
+    *running_seen = 0;
+    *samples_read = 0;
+    if (sample_count <= 0) sample_count = 1;
+    if (interval_ms < 0) interval_ms = 0;
+    for (index = 0; index < sample_count; ++index) {
+        if (read_fan_tach(path, &value) != 0) return -1;
+        *last_value = value;
+        *samples_read = index + 1;
+        if (value == 1) {
+            *running_seen = 1;
+            return 0;
+        }
+        if (index + 1 < sample_count) sleep_ms_local(interval_ms);
+    }
+    return 0;
+}
+
 static int run_finished_product_fan(int fd, const char *test_start, const char *test_end)
 {
     char pwm_path[192] = "/sys/class/hwmon/hwmon12/pwm1";
@@ -1314,7 +1710,11 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     int start_value = param_int(test_start, test_end, "startValue", 100);
     int stop_value = param_int(test_start, test_end, "stopValue", 0);
     int settle_ms = param_int(test_start, test_end, "tachSettleMs", 1000);
+    int tach_sample_count = param_int(test_start, test_end, "tachSampleCount", 3);
+    int tach_sample_interval_ms = param_int(test_start, test_end, "tachSampleIntervalMs", 300);
     int tach_value = 0;
+    int tach_running_seen = 0;
+    int tach_samples_read = 0;
 
     param_string(test_start, test_end, "pwmPath", pwm_path, sizeof(pwm_path));
     param_string(test_start, test_end, "tachPath", tach_path, sizeof(tach_path));
@@ -1334,7 +1734,8 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
         };
         nanosleep(&settle_time, NULL);
     }
-    if (read_fan_tach(tach_path, &tach_value) != 0) {
+    if (read_fan_tach_stable(tach_path, tach_sample_count, tach_sample_interval_ms,
+                             &tach_value, &tach_running_seen, &tach_samples_read) != 0) {
         write_fan_pwm(pwm_path, stop_value);
         snprintf(data, sizeof(data), "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRead\":false}", tach_path);
         send_report(fd, "fan", "failed", 3922, "Unable to read fan tach_rpm", data);
@@ -1346,10 +1747,235 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
         return -1;
     }
     snprintf(data, sizeof(data),
-             "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,\"pwmStopped\":true}",
-             tach_path, tach_value, tach_value == 1 ? "true" : "false");
-    return send_report(fd, "fan", tach_value == 1 ? "passed" : "failed", tach_value == 1 ? 0 : 3910,
-                       tach_value == 1 ? "Fan tach_rpm indicates running" : "Fan tach_rpm indicates stopped", data) == 0 && tach_value == 1 ? 0 : -1;
+             "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,"
+             "\"tachSampleCount\":%d,\"tachSamplesRead\":%d,\"tachSampleIntervalMs\":%d,\"pwmStopped\":true}",
+             tach_path, tach_value, tach_running_seen ? "true" : "false",
+             tach_sample_count, tach_samples_read, tach_sample_interval_ms);
+    return send_report(fd, "fan", tach_running_seen ? "passed" : "failed", tach_running_seen ? 0 : 3910,
+                       tach_running_seen ? "Fan tach_rpm indicates running" : "Fan tach_rpm indicates stopped", data) == 0 && tach_running_seen ? 0 : -1;
+}
+
+static int run_ethernet_led_command(const char *interface_name, int gigabit)
+{
+    char command[256];
+    const char *speed_args = gigabit
+        ? "autoneg on advertise 0x0028"
+        : "speed 100 duplex full autoneg off";
+    if (geteuid() == 0) {
+        snprintf(command, sizeof(command), "ethtool -s %s %s >/dev/null 2>&1", interface_name, speed_args);
+    } else {
+        snprintf(command, sizeof(command), "sudo -n ethtool -s %s %s >/dev/null 2>&1", interface_name, speed_args);
+    }
+    return system(command) == 0 ? 0 : -1;
+}
+
+static int run_ethernet_led_shell(const char *command)
+{
+    int rc;
+    if (command == NULL || command[0] == '\0') return -1;
+    rc = system(command);
+    return rc == 0 ? 0 : -1;
+}
+
+static void reconnect_ethernet_led_interface(const char *interface_name)
+{
+    char command[256];
+    snprintf(command, sizeof(command), "ip link set dev %s up >/dev/null 2>&1", interface_name);
+    (void)run_ethernet_led_shell(command);
+    snprintf(command, sizeof(command), "nmcli device reapply %s >/dev/null 2>&1", interface_name);
+    (void)run_ethernet_led_shell(command);
+    snprintf(command, sizeof(command), "nmcli device connect %s >/dev/null 2>&1", interface_name);
+    (void)run_ethernet_led_shell(command);
+}
+
+static int read_ethernet_led_speed_mbps(const char *interface_name)
+{
+    char path[160];
+    FILE *file;
+    int speed_mbps = 0;
+    if (interface_name == NULL || interface_name[0] == '\0') return -1;
+    snprintf(path, sizeof(path), "/sys/class/net/%s/speed", interface_name);
+    file = fopen(path, "r");
+    if (file == NULL) return -1;
+    if (fscanf(file, "%d", &speed_mbps) != 1) {
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    return speed_mbps;
+}
+
+static int wait_ethernet_led_speed(const char *interface_name, int expected_speed_mbps,
+                                   int timeout_ms, int *actual_speed_mbps)
+{
+    int elapsed_ms = 0;
+    int speed_mbps = -1;
+    if (timeout_ms <= 0) timeout_ms = 10000;
+    while (elapsed_ms <= timeout_ms) {
+        if (net_carrier_is_up(interface_name)) {
+            speed_mbps = read_ethernet_led_speed_mbps(interface_name);
+            if (speed_mbps == expected_speed_mbps) {
+                if (actual_speed_mbps != NULL) *actual_speed_mbps = speed_mbps;
+                return 0;
+            }
+        }
+        sleep_ms_local(200);
+        elapsed_ms += 200;
+    }
+    if (actual_speed_mbps != NULL) *actual_speed_mbps = speed_mbps;
+    return -1;
+}
+
+static void restore_ethernet_led_autoneg(const char *interface_name)
+{
+    char command[256];
+    if (geteuid() == 0) {
+        snprintf(command, sizeof(command), "ethtool -s %s autoneg on advertise 0x0028 >/dev/null 2>&1", interface_name);
+    } else {
+        snprintf(command, sizeof(command), "sudo -n ethtool -s %s autoneg on advertise 0x0028 >/dev/null 2>&1", interface_name);
+    }
+    (void)run_ethernet_led_shell(command);
+
+    reconnect_ethernet_led_interface(interface_name);
+}
+
+static int run_ethernet_led(int fd, const char *test_start, const char *test_end)
+{
+    char interface_name[64] = "end0";
+    char data[768];
+    int wait_cable_timeout_ms = param_int(test_start, test_end, "waitCableTimeoutMs", 15000);
+    int progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", 1000);
+    int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 2000);
+    int settle_ms = param_int(test_start, test_end, "settleMs", 2000);
+    int speed_wait_timeout_ms = param_int(test_start, test_end, "speedWaitTimeoutMs", 10000);
+    int cycle_count = param_int(test_start, test_end, "cycleCount", 2);
+    int timeout_ms = param_int(test_start, test_end, "manualDecisionTimeoutMs", 15000);
+    int wait_cable_elapsed_ms = 0;
+    int disconnected = 0;
+    int passed = 0;
+    int cycle;
+    int phase;
+
+    param_string(test_start, test_end, "interfaceName", interface_name, sizeof(interface_name));
+    timeout_ms = param_int(test_start, test_end, "timeoutMs", timeout_ms);
+    if (wait_cable_timeout_ms <= 0) wait_cable_timeout_ms = 15000;
+    if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
+    if (phase_ms <= 0) phase_ms = 2000;
+    if (settle_ms < 0) settle_ms = 0;
+    if (speed_wait_timeout_ms <= 0) speed_wait_timeout_ms = 10000;
+    if (cycle_count <= 0) cycle_count = 2;
+    if (cycle_count > 10) cycle_count = 10;
+    if (timeout_ms <= 0) timeout_ms = 15000;
+
+    snprintf(data, sizeof(data),
+             "{\"interfaceName\":\"%s\",\"phase\":\"wait_cable\",\"ethernetLinkUp\":false,"
+             "\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":0}",
+             interface_name, wait_cable_timeout_ms);
+    send_report(fd, "ethernet_led", "running", 0, "Insert Ethernet cable for LED test", data);
+
+    while (wait_cable_elapsed_ms < wait_cable_timeout_ms && !net_carrier_is_up(interface_name)) {
+        sleep_ms_local(progress_report_interval_ms);
+        wait_cable_elapsed_ms += progress_report_interval_ms;
+        snprintf(data, sizeof(data),
+                 "{\"interfaceName\":\"%s\",\"phase\":\"wait_cable\",\"ethernetLinkUp\":false,"
+                 "\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":%d}",
+                 interface_name, wait_cable_timeout_ms, wait_cable_elapsed_ms);
+        send_report(fd, "ethernet_led", "running", 0, "Waiting for Ethernet cable for LED test", data);
+    }
+
+    if (!net_carrier_is_up(interface_name)) {
+        snprintf(data, sizeof(data),
+                 "{\"interfaceName\":\"%s\",\"phase\":\"wait_cable\",\"ethernetLinkUp\":false,"
+                 "\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"failureReason\":\"ethernet_insert_timeout\"}",
+                 interface_name, wait_cable_timeout_ms);
+        send_report(fd, "ethernet_led", "failed", 4811, "Ethernet cable insert timeout before LED test", data);
+        return -1;
+    }
+
+    for (cycle = 1; cycle <= cycle_count; ++cycle) {
+        for (phase = 0; phase < 2; ++phase) {
+            const int gigabit = phase == 1;
+            const int expected_speed_mbps = gigabit ? 1000 : 100;
+            const char *phase_name = gigabit ? "show_1000m" : "show_100m";
+            const char *expected_led = gigabit ? "yellow" : "green";
+            int actual_speed_mbps = -1;
+
+            if (run_ethernet_led_command(interface_name, gigabit) != 0) {
+                restore_ethernet_led_autoneg(interface_name);
+                snprintf(data, sizeof(data),
+                         "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"cycleIndex\":%d,\"cycleCount\":%d,"
+                         "\"expectedLed\":\"%s\",\"expectedSpeedMbps\":%d,\"failureReason\":\"ethtool_command_failed\"}",
+                         interface_name, phase_name, cycle, cycle_count, expected_led, expected_speed_mbps);
+                send_report(fd, "ethernet_led", "failed", 4812, "Unable to switch Ethernet LED speed mode", data);
+                return -1;
+            }
+
+            if (settle_ms > 0) sleep_ms_local(settle_ms);
+            reconnect_ethernet_led_interface(interface_name);
+            if (wait_ethernet_led_speed(interface_name, expected_speed_mbps,
+                                        speed_wait_timeout_ms, &actual_speed_mbps) != 0) {
+                restore_ethernet_led_autoneg(interface_name);
+                snprintf(data, sizeof(data),
+                         "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"cycleIndex\":%d,\"cycleCount\":%d,"
+                         "\"expectedLed\":\"%s\",\"expectedSpeedMbps\":%d,\"actualSpeedMbps\":%d,"
+                         "\"failureReason\":\"speed_verify_failed\"}",
+                         interface_name, phase_name, cycle, cycle_count, expected_led,
+                         expected_speed_mbps, actual_speed_mbps);
+                send_report(fd, "ethernet_led", "failed", 4813, "Ethernet LED speed mode did not become stable", data);
+                return -1;
+            }
+
+            snprintf(data, sizeof(data),
+                     "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"ethernetLinkUp\":true,"
+                     "\"cycleIndex\":%d,\"cycleCount\":%d,\"expectedLed\":\"%s\","
+                     "\"expectedSpeedMbps\":%d,\"actualSpeedMbps\":%d,"
+                     "\"phaseDurationMs\":%d,\"settleMs\":%d,\"timeoutMs\":%d}",
+                     interface_name, phase_name, cycle, cycle_count, expected_led,
+                     expected_speed_mbps, actual_speed_mbps, phase_ms, settle_ms, timeout_ms);
+            send_report(fd, "ethernet_led", "running", 0,
+                        gigabit ? "Ethernet LED 1000M mode; observe yellow LED" :
+                                  "Ethernet LED 100M mode; observe green LED",
+                        data);
+            sleep_ms_local(phase_ms);
+        }
+    }
+
+    snprintf(data, sizeof(data),
+             "{\"manualObserved\":true,\"requiresOperatorDecision\":true,\"interfaceName\":\"%s\","
+             "\"displayMode\":\"100m_1000m_led_sequence\",\"cycleCount\":%d,\"timeoutMs\":%d}",
+             interface_name, cycle_count, timeout_ms);
+    send_report(fd, "ethernet_led", "running", 0,
+                "Waiting for operator decision after Ethernet LED sequence",
+                data);
+
+    switch (wait_operator_decision_or_disconnect(fd, "ethernet_led", timeout_ms, &passed, &disconnected)) {
+    case 1:
+        restore_ethernet_led_autoneg(interface_name);
+        snprintf(data, sizeof(data),
+                 "{\"manualObserved\":true,\"operatorConfirmed\":%s,\"interfaceName\":\"%s\","
+                 "\"displayMode\":\"100m_1000m_led_sequence\",\"timeoutMs\":%d}",
+                 passed ? "true" : "false", interface_name, timeout_ms);
+        return send_report(fd, "ethernet_led", passed ? "passed" : "failed",
+                           passed ? 0 : 3910,
+                           passed ? "Operator confirmed Ethernet LEDs pass" :
+                                    "Operator confirmed Ethernet LEDs fail",
+                           data) == 0 && passed ? 0 : -1;
+    case 0:
+        restore_ethernet_led_autoneg(interface_name);
+        snprintf(data, sizeof(data),
+                 "{\"manualObserved\":true,\"operatorConfirmed\":false,\"interfaceName\":\"%s\","
+                 "\"displayMode\":\"100m_1000m_led_sequence\",\"timeoutMs\":%d}",
+                 interface_name, timeout_ms);
+        send_report(fd, "ethernet_led", "failed", 3911, "Operator decision timed out", data);
+        return -1;
+    case 2:
+        restore_ethernet_led_autoneg(interface_name);
+        return -2;
+    default:
+        restore_ethernet_led_autoneg(interface_name);
+        send_report(fd, "ethernet_led", "failed", 3912, "Unable to read operator decision", "{}");
+        return -1;
+    }
 }
 
 static int run_finished_product_indicator_led(int fd, const char *test_start, const char *test_end)
@@ -1762,11 +2388,13 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     char test_mode[32] = "pcba";
     param_string(test_start, test_end, "mode", test_mode, sizeof(test_mode));
     if (strcmp(test_id, "board_state") == 0) return run_board_state(fd);
+    if (strcmp(test_id, "emmc") == 0 || strcmp(test_id, "ddr") == 0) return run_emmc_ddr(fd, test_id, test_start, test_end);
     if (strcmp(test_id, "hdmi") == 0) return run_manual_observation(fd, "hdmi", "HDMI", test_start, test_end);
     if (strcmp(test_id, "lcd") == 0) return run_manual_observation(fd, "lcd", "LCD", test_start, test_end);
     if (strcmp(test_id, "reset_button") == 0) return run_manual_observation(fd, "reset_button", "Reset button and LCD off state", test_start, test_end);
     if (strcmp(test_id, "fan") == 0 && strcmp(test_mode, "finished_product") == 0) return run_finished_product_fan(fd, test_start, test_end);
     if (strcmp(test_id, "fan") == 0) return run_skipped_test(fd, "fan", test_start, test_end);
+    if (strcmp(test_id, "ethernet_led") == 0) return run_ethernet_led(fd, test_start, test_end);
     if (strcmp(test_id, "indicator_led") == 0 && strcmp(test_mode, "finished_product") == 0) {
         return run_finished_product_indicator_led(fd, test_start, test_end);
     }
@@ -1774,8 +2402,6 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     if (strcmp(test_id, "ethernet") == 0) return run_ethernet(fd, test_start, test_end);
     if (strcmp(test_id, "wifi") == 0) return run_wifi(fd, config, test_start, test_end);
     if (strcmp(test_id, "tf") == 0) return run_tf_card(fd, config, test_start, test_end);
-    if (strcmp(test_id, "usb2") == 0) return run_usb_variant(fd, test_start, test_end, 2);
-    if (strcmp(test_id, "usb3") == 0) return run_usb_variant(fd, test_start, test_end, 3);
     if (strcmp(test_id, "usb2_3") == 0) return run_usb2_3(fd, test_start, test_end);
     if (strcmp(test_id, "pcba_test_points") == 0) return run_pcba_test_points(fd, test_start, test_end);
     if (strcmp(test_id, "bluetooth") == 0) return run_bluetooth(fd, config, test_start, test_end);
@@ -1793,12 +2419,13 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
 static int failure_code_for_test(const char *test_id)
 {
     if (strcmp(test_id, "board_state") == 0) return 3001;
+    if (strcmp(test_id, "emmc") == 0) return 3016;
+    if (strcmp(test_id, "ddr") == 0) return 3017;
     if (strcmp(test_id, "fingerprint") == 0) return 3002;
     if (strcmp(test_id, "ethernet") == 0) return 3011;
+    if (strcmp(test_id, "ethernet_led") == 0) return 3015;
     if (strcmp(test_id, "wifi") == 0) return 3003;
     if (strcmp(test_id, "tf") == 0) return 3004;
-    if (strcmp(test_id, "usb2") == 0) return 3012;
-    if (strcmp(test_id, "usb3") == 0) return 3016;
     if (strcmp(test_id, "usb2_3") == 0) return 3012;
     if (strcmp(test_id, "pcba_test_points") == 0) return 3013;
     if (strcmp(test_id, "bluetooth") == 0) return 3005;
@@ -1825,6 +2452,7 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
     char test_id[80];
     char session_start_time[40];
     char session_end_time[40];
+    int rc;
 
     format_timestamp_now(session_start_time, sizeof(session_start_time));
 
@@ -1835,7 +2463,11 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
             skipped_count++;
             continue;
         }
-        if (run_one_test(fd, test_id, config, test_start, test_end) != 0) {
+        rc = run_one_test(fd, test_id, config, test_start, test_end);
+        if (rc == -2) {
+            return -2;
+        }
+        if (rc != 0) {
             remember_failure(&failed_count, &first_failed_code,
                              first_failed_test, sizeof(first_failed_test),
                              failure_code_for_test(test_id), test_id);
