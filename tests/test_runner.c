@@ -570,7 +570,7 @@ static int run_tf_card(int fd, const struct app_config *config, const char *test
     return send_report(fd, "tf", "passed", 0, result.message, data);
 }
 
-static int run_usb2_3(int fd, const char *test_start, const char *test_end)
+static int run_usb_variant(int fd, const char *test_start, const char *test_end, int usb_version)
 {
     char record_file[160] = "/tmp/spacetest_usb_ports.json";
     char test_mode[32] = "pcba";
@@ -584,24 +584,30 @@ static int run_usb2_3(int fd, const char *test_start, const char *test_end)
              strcmp(test_mode, "finished_product") == 0 ? "finished_product" : "pcba");
 
     snprintf(data, sizeof(data),
-             "{\"recordFile\":\"%s\",\"mode\":\"%s\",\"requiredUsb2Cycles\":4,\"requiredUsb3Cycles\":4}", record_file, test_mode);
-    send_report(fd, "usb2_3", "running", 0, "Read USB connectivity pretest result", data);
+             "{\"recordFile\":\"%s\",\"mode\":\"%s\",\"usbVersion\":\"usb%d\",\"requiredCycles\":4}", record_file, test_mode, usb_version);
+    send_report(fd, usb_version == 2 ? "usb2" : "usb3", "running", 0, usb_version == 2 ? "Read USB2.0 connectivity pretest result" : "Read USB3.0 connectivity pretest result", data);
     file = fopen(record_file, "r");
     if (file == NULL || fgets(content, sizeof(content), file) == NULL) {
         if (file != NULL) fclose(file);
-        send_report(fd, "usb2_3", "failed", 4901, "USB pretest result file not found", data);
+        send_report(fd, usb_version == 2 ? "usb2" : "usb3", "failed", 4901, "USB pretest result file not found", data);
         return -1;
     }
     fclose(file);
     if (strstr(content, "\"overallResult\":\"passed\"") == NULL ||
-        strstr(content, "\"usb2Cycles\":4") == NULL ||
-        strstr(content, "\"usb3Cycles\":4") == NULL ||
+        (usb_version == 2 ? strstr(content, "\"usb2Cycles\":4") == NULL : strstr(content, "\"usb3Cycles\":4") == NULL) ||
         (strcmp(test_mode, "finished_product") == 0 && strstr(content, "\"testMode\":\"finished_product\"") == NULL) ||
         (strcmp(test_mode, "finished_product") != 0 && strstr(content, "\"testMode\":\"pcba\"") == NULL)) {
-        send_report(fd, "usb2_3", "failed", 4902, "USB pretest connectivity result failed or mode mismatch", data);
+        send_report(fd, usb_version == 2 ? "usb2" : "usb3", "failed", 4902, "USB pretest connectivity result failed or mode mismatch", data);
         return -1;
     }
-    return send_report(fd, "usb2_3", "passed", 0, "USB2.0 and USB3.0 connectivity pretest passed", data);
+    return send_report(fd, usb_version == 2 ? "usb2" : "usb3", "passed", 0, usb_version == 2 ? "USB2.0 connectivity pretest passed" : "USB3.0 connectivity pretest passed", data);
+}
+
+static int run_usb2_3(int fd, const char *test_start, const char *test_end)
+{
+    int rc = run_usb_variant(fd, test_start, test_end, 2);
+    if (rc != 0) return rc;
+    return run_usb_variant(fd, test_start, test_end, 3);
 }
 
 static void append_pcba_points_json(char *data, size_t data_size,
@@ -1768,6 +1774,8 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     if (strcmp(test_id, "ethernet") == 0) return run_ethernet(fd, test_start, test_end);
     if (strcmp(test_id, "wifi") == 0) return run_wifi(fd, config, test_start, test_end);
     if (strcmp(test_id, "tf") == 0) return run_tf_card(fd, config, test_start, test_end);
+    if (strcmp(test_id, "usb2") == 0) return run_usb_variant(fd, test_start, test_end, 2);
+    if (strcmp(test_id, "usb3") == 0) return run_usb_variant(fd, test_start, test_end, 3);
     if (strcmp(test_id, "usb2_3") == 0) return run_usb2_3(fd, test_start, test_end);
     if (strcmp(test_id, "pcba_test_points") == 0) return run_pcba_test_points(fd, test_start, test_end);
     if (strcmp(test_id, "bluetooth") == 0) return run_bluetooth(fd, config, test_start, test_end);
@@ -1789,6 +1797,8 @@ static int failure_code_for_test(const char *test_id)
     if (strcmp(test_id, "ethernet") == 0) return 3011;
     if (strcmp(test_id, "wifi") == 0) return 3003;
     if (strcmp(test_id, "tf") == 0) return 3004;
+    if (strcmp(test_id, "usb2") == 0) return 3012;
+    if (strcmp(test_id, "usb3") == 0) return 3016;
     if (strcmp(test_id, "usb2_3") == 0) return 3012;
     if (strcmp(test_id, "pcba_test_points") == 0) return 3013;
     if (strcmp(test_id, "bluetooth") == 0) return 3005;
