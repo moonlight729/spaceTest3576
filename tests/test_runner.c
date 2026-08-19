@@ -2270,6 +2270,8 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
     request.require_exposure_interrupt = param_bool(test_start, test_end, "requireExposureInterrupt", request.require_exposure_interrupt);
     request.require_pwm_pulse = param_bool(test_start, test_end, "requirePwmPulse", request.require_pwm_pulse);
     request.pwm_min_pulse_delta = param_int(test_start, test_end, "minPwmPulseDelta", request.pwm_min_pulse_delta);
+    if (request.stream_frame_count <= 0) request.stream_frame_count = 90;
+    if (request.pwm_min_pulse_delta <= 0) request.pwm_min_pulse_delta = 86;
     wait_camera_timeout_ms = param_int(test_start, test_end, "waitCameraTimeoutMs", wait_camera_timeout_ms);
     progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
