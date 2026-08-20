@@ -5,6 +5,7 @@ APP_OBJECTS = \
 	config/app_config.o \
 	protocol/protocol.o \
 	storage/board_state.o \
+	hardware/fingerprint/fingerprint.o \
 	hardware/indicator_led/indicator_led.o \
 	hardware/bluetooth/bluetoothctl_scan.o \
 	hardware/camera/camera_stream.o \
@@ -14,7 +15,7 @@ APP_OBJECTS = \
 	hardware/wifi/wifi_nmcli.o \
 	hardware/tf_card/tf_card.o \
 	hardware/usb3.0/usb3_file_check.o \
-	hardware/usb_pretest/usb_pretest.o \
+	hardware/usb/usb_insert_test.o \
 	hardware/pcba_points/pcba_points_file.o \
 	hardware/pressure/pressure_stress.o \
 	hardware/pressure/pressure_peripheral.o \
@@ -33,6 +34,8 @@ protocol/protocol.o: protocol/protocol.c protocol/protocol.h
 	$(CC) $(CFLAGS) -c protocol/protocol.c -o $@
 storage/board_state.o: storage/board_state.c storage/board_state.h
 	$(CC) $(CFLAGS) -c storage/board_state.c -o $@
+hardware/fingerprint/fingerprint.o: hardware/fingerprint/fingerprint.c hardware/fingerprint/fingerprint.h
+	$(CC) $(CFLAGS) -c hardware/fingerprint/fingerprint.c -o $@
 hardware/indicator_led/indicator_led.o: hardware/indicator_led/indicator_led.c hardware/indicator_led/indicator_led.h
 	$(CC) $(CFLAGS) -c hardware/indicator_led/indicator_led.c -o $@
 hardware/bluetooth/bluetoothctl_scan.o: hardware/bluetooth/bluetoothctl_scan.c hardware/bluetooth/bluetoothctl_scan.h
@@ -51,19 +54,19 @@ hardware/tf_card/tf_card.o: hardware/tf_card/tf_card.c hardware/tf_card/tf_card.
 	$(CC) $(CFLAGS) -c hardware/tf_card/tf_card.c -o $@
 hardware/usb3.0/usb3_file_check.o: hardware/usb3.0/usb3_file_check.c hardware/usb3.0/usb3_file_check.h
 	$(CC) $(CFLAGS) -c hardware/usb3.0/usb3_file_check.c -o $@
-hardware/usb_pretest/usb_pretest.o: hardware/usb_pretest/usb_pretest.c hardware/usb_pretest/usb_pretest.h config/app_config.h
-	$(CC) $(CFLAGS) -pthread -c hardware/usb_pretest/usb_pretest.c -o $@
+hardware/usb/usb_insert_test.o: hardware/usb/usb_insert_test.c hardware/usb/usb_insert_test.h
+	$(CC) $(CFLAGS) -c hardware/usb/usb_insert_test.c -o $@
 hardware/pcba_points/pcba_points_file.o: hardware/pcba_points/pcba_points_file.c hardware/pcba_points/pcba_points_file.h
 	$(CC) $(CFLAGS) -c hardware/pcba_points/pcba_points_file.c -o $@
 hardware/pressure/pressure_stress.o: hardware/pressure/pressure_stress.c hardware/pressure/pressure_stress.h
 	$(CC) $(CFLAGS) -c hardware/pressure/pressure_stress.c -o $@
 hardware/pressure/pressure_peripheral.o: hardware/pressure/pressure_peripheral.c hardware/pressure/pressure_peripheral.h
 	$(CC) $(CFLAGS) -c hardware/pressure/pressure_peripheral.c -o $@
-tests/test_runner.o: tests/test_runner.c tests/test_runner.h protocol/protocol.h storage/board_state.h hardware/indicator_led/indicator_led.h hardware/bluetooth/bluetoothctl_scan.h hardware/camera/camera_stream.h hardware/ethernet/ethernet_nmcli.h hardware/fast_charge/fast_charge.h hardware/keys/key_input.h hardware/wifi/wifi_nmcli.h hardware/tf_card/tf_card.h hardware/usb3.0/usb3_file_check.h hardware/pcba_points/pcba_points_file.h
+tests/test_runner.o: tests/test_runner.c tests/test_runner.h protocol/protocol.h storage/board_state.h hardware/fingerprint/fingerprint.h hardware/indicator_led/indicator_led.h hardware/bluetooth/bluetoothctl_scan.h hardware/camera/camera_stream.h hardware/ethernet/ethernet_nmcli.h hardware/fast_charge/fast_charge.h hardware/keys/key_input.h hardware/wifi/wifi_nmcli.h hardware/tf_card/tf_card.h hardware/usb3.0/usb3_file_check.h hardware/usb/usb_insert_test.h hardware/pcba_points/pcba_points_file.h
 	$(CC) $(CFLAGS) -c tests/test_runner.c -o $@
-manage/session_manager.o: manage/session_manager.c manage/session_manager.h protocol/protocol.h storage/board_state.h tests/test_runner.h
+manage/session_manager.o: manage/session_manager.c manage/session_manager.h protocol/protocol.h storage/board_state.h tests/test_runner.h hardware/pressure/pressure_stress.h hardware/pressure/pressure_peripheral.h
 	$(CC) $(CFLAGS) -c manage/session_manager.c -o $@
-main.o: main.c config/app_config.h manage/session_manager.h hardware/usb_pretest/usb_pretest.h
+main.o: main.c config/app_config.h manage/session_manager.h
 	$(CC) $(CFLAGS) -c main.c -o $@
 
 clean:
