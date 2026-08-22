@@ -207,7 +207,6 @@ int wifi_nmcli_scan_signal(struct wifi_device *device, const struct wifi_request
                            struct wifi_result *result)
 {
     char output[WIFI_CMD_OUTPUT];
-    char *radio_argv[] = { "nmcli", "radio", "wifi", "on", NULL };
     char *link_argv[] = { "ip", "link", "set", "dev", device != NULL ? device->interface_name : NULL, "up", NULL };
     char *scan_argv[] = { "iw", "dev", device != NULL ? device->interface_name : NULL, "scan", NULL };
 
@@ -220,10 +219,8 @@ int wifi_nmcli_scan_signal(struct wifi_device *device, const struct wifi_request
     memset(result, 0, sizeof(*result));
     result->rssi = -127;
 
-    if (run_command(radio_argv, output, sizeof(output)) != 0) {
-        set_error(result, 4104, output[0] ? output : "failed to enable Wi-Fi radio", "wifi_radio_off");
-        return -1;
-    }
+    /* The production service keeps Wi-Fi enabled; scanning must not require
+     * NetworkManager authorization just to toggle an already-on radio. */
     result->wifi_enabled = true;
 
     if (run_command(link_argv, output, sizeof(output)) != 0) {
@@ -242,7 +239,9 @@ int wifi_nmcli_scan_signal(struct wifi_device *device, const struct wifi_request
             result->scan_retry_count = scan_attempt;
             sleep_ms_wifi(WIFI_SCAN_BUSY_RETRY_INTERVAL_MS * scan_attempt);
         }
-        if (scan_rc != 0) {
+        /* Some drivers return a non-zero status while still producing a
+         * complete BSS list. Treat that output as a usable scan result. */
+        if (scan_rc != 0 && strstr(output, "BSS ") == NULL) {
             result->scan_retry_count = scan_attempt > 1 ? scan_attempt - 1 : 0;
             set_error(result, 4101, output[0] ? output : "iw scan command failed", "scan_command_failed");
             return -1;

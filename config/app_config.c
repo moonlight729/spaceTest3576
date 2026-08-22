@@ -13,7 +13,7 @@ void app_config_load_defaults(struct app_config *config)
     config->bind_address = "0.0.0.0";
     config->port = 19001;
     config->board_state_path = "/userdata/factory_test/spacetest3576_board_state.txt";
-    config->wifi_ssid = "originflow";
+    config->wifi_ssid = "Xiaomi_9994";
     config->wifi_router_ip = "192.168.110.1";
     config->tf_device_path = "/dev/mmcblk1p1";
     config->tf_mount_point = "/mnt/spacetest_tf";

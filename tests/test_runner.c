@@ -370,7 +370,7 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     int retry_interval_ms = 2000;
     int decision_timeout_ms = 5000;
     int scan_timeout_ms = 10000;
-    int min_rssi = -55;
+    int min_rssi = -40;
     int attempt;
     struct wifi_request request = {
         .ssid = ssid,
@@ -464,9 +464,10 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
             snprintf(data, sizeof(data),
                      "{\"ssid\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"completed\",\"attempt\":%d,"
                      "\"maxRetryCount\":%d,\"found\":%s,\"rssi\":%d,\"minRssi\":%d,"
-                     "\"failureReason\":\"host_rejected\"}",
+                     "\"failureReason\":\"%s\"}",
                      ssid, device.interface_name, attempt, max_retry_count,
-                     result.found ? "true" : "false", result.rssi, min_rssi);
+                     result.found ? "true" : "false", result.rssi, min_rssi,
+                     result.found ? "rssi_too_low" : "ssid_not_found");
             wifi_nmcli_close(&device);
             send_report(fd, "wifi", "failed", 4106, "Host confirmed Wi-Fi RSSI fail", data);
             return -1;
