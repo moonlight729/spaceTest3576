@@ -13,6 +13,8 @@ struct camera_stream_request {
     bool require_pwm_pulse;
     const char *pwm_status_path;
     int pwm_min_pulse_delta;
+    int expected_sync_rate;
+    int sync_rate_tolerance_percent;
 };
 
 struct camera_stream_result {
@@ -27,6 +29,11 @@ struct camera_stream_result {
     long long pwm_mono_ns;
     long long pwm_rtc_ns;
     bool pwm_ok;
+    int capture_elapsed_ms;
+    int actual_frame_rate_milli;
+    int sync_rate_milli;
+    bool frame_rate_ok;
+    bool sync_rate_ok;
     int error_code;
     char message[192];
 };

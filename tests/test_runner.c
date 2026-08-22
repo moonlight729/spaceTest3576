@@ -2523,6 +2523,8 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
         .require_pwm_pulse = config->camera_require_pwm_pulse != 0,
         .pwm_status_path = pwm_status_path,
         .pwm_min_pulse_delta = config->camera_pwm_min_pulse_delta,
+        .expected_sync_rate = 30,
+        .sync_rate_tolerance_percent = 10,
     };
     struct camera_stream_result result;
     char data[1024];
@@ -2543,6 +2545,9 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
     request.require_exposure_interrupt = param_bool(test_start, test_end, "requireExposureInterrupt", request.require_exposure_interrupt);
     request.require_pwm_pulse = param_bool(test_start, test_end, "requirePwmPulse", request.require_pwm_pulse);
     request.pwm_min_pulse_delta = param_int(test_start, test_end, "minPwmPulseDelta", request.pwm_min_pulse_delta);
+    request.expected_sync_rate = param_int(test_start, test_end, "expectedSyncRate", request.expected_sync_rate);
+    request.sync_rate_tolerance_percent = param_int(test_start, test_end, "syncRateTolerancePercent", request.sync_rate_tolerance_percent);
+    if (request.sync_rate_tolerance_percent < 0) request.sync_rate_tolerance_percent = 0;
     if (request.stream_frame_count <= 0) request.stream_frame_count = 90;
     if (request.pwm_min_pulse_delta <= 0) request.pwm_min_pulse_delta = 86;
     wait_camera_timeout_ms = param_int(test_start, test_end, "waitCameraTimeoutMs", wait_camera_timeout_ms);

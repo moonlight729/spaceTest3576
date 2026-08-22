@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 
 #define CAMERA_BUFFER_COUNT 4
 
@@ -184,6 +185,9 @@ int camera_stream_run_test(const struct camera_stream_request *request,
     struct sync_pwm_status pwm_before;
     struct sync_pwm_status pwm_after;
     int i;
+    struct timespec capture_start;
+    struct timespec capture_end;
+    int capture_elapsed_ms;
 
     if (request == NULL || result == NULL || request->device_path == NULL ||
         request->stream_frame_count <= 0 || request->timeout_ms <= 0) {
@@ -228,6 +232,7 @@ int camera_stream_run_test(const struct camera_stream_request *request,
         set_message(result, 4703, "Unable to prepare camera streaming buffers");
         return -1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &capture_start);
     if (capture_frames(fd, request->stream_frame_count, request->timeout_ms,
                        &result->captured_frames) != 0) {
         unmap_buffers(buffers, mapped_count);
@@ -235,6 +240,15 @@ int camera_stream_run_test(const struct camera_stream_request *request,
         set_message(result, 4704, "Unable to capture camera stream frames");
         return -1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &capture_end);
+    capture_elapsed_ms = (int)((capture_end.tv_sec - capture_start.tv_sec) * 1000L +
+                               (capture_end.tv_nsec - capture_start.tv_nsec) / 1000000L);
+    if (capture_elapsed_ms < 1) capture_elapsed_ms = 1;
+    result->capture_elapsed_ms = capture_elapsed_ms;
+    result->actual_frame_rate_milli = (int)((long long)result->captured_frames * 1000000LL / capture_elapsed_ms);
+    result->frame_rate_ok = request->expected_sync_rate <= 0 ||
+        (result->actual_frame_rate_milli >= request->expected_sync_rate * (100 - request->sync_rate_tolerance_percent) * 10 &&
+         result->actual_frame_rate_milli <= request->expected_sync_rate * (100 + request->sync_rate_tolerance_percent) * 10);
     unmap_buffers(buffers, mapped_count);
     close(fd);
     result->stream_ok = true;
@@ -263,8 +277,13 @@ int camera_stream_run_test(const struct camera_stream_request *request,
         result->pwm_mono_ns = pwm_after.mono_ns;
         result->pwm_rtc_ns = pwm_after.rtc_ns;
         result->pwm_ok = result->pwm_pulse_delta >= (unsigned long long)request->pwm_min_pulse_delta;
+        result->sync_rate_milli = (int)(result->pwm_pulse_delta * 1000000LL / capture_elapsed_ms);
+        result->sync_rate_ok = request->expected_sync_rate <= 0 ||
+            (result->sync_rate_milli >= request->expected_sync_rate * (100 - request->sync_rate_tolerance_percent) * 10 &&
+             result->sync_rate_milli <= request->expected_sync_rate * (100 + request->sync_rate_tolerance_percent) * 10);
+        result->pwm_ok = result->pwm_ok && result->sync_rate_ok;
         if (!result->pwm_ok) {
-            set_message(result, 4709, "PWM pulse count is below requirement");
+            set_message(result, result->sync_rate_ok ? 4709 : 4710, result->sync_rate_ok ? "PWM pulse count is below requirement" : "Camera sync rate is outside expected range");
             return -1;
         }
     }
