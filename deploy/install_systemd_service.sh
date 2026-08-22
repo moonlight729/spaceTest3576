@@ -4,7 +4,7 @@ set -eu
 SERVICE_NAME=spacetest3576.service
 SERVICE_SRC="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$SERVICE_NAME"
 SERVICE_DST="/etc/systemd/system/$SERVICE_NAME"
-APP_DIR="/home/originflow/work/spaceTest3576"
+APP_DIR="/userdata/work/spaceTest3576"
 APP_BIN="$APP_DIR/spacetest3576"
 
 if [ ! -f "$SERVICE_SRC" ]; then
