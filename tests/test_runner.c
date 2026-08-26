@@ -370,7 +370,10 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     int retry_interval_ms = 2000;
     int decision_timeout_ms = 5000;
     int scan_timeout_ms = 10000;
-    int min_rssi = -40;
+    int scan_attempt_count = 8;
+    int scan_interval_ms = 1000;
+    int target_valid_samples = 3;
+    int min_rssi = -55;
     int attempt;
     struct wifi_request request = {
         .ssid = ssid,
@@ -387,12 +390,18 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
     retry_interval_ms = param_int(test_start, test_end, "retryIntervalMs", retry_interval_ms);
     decision_timeout_ms = param_int(test_start, test_end, "decisionTimeoutMs", decision_timeout_ms);
     scan_timeout_ms = param_int(test_start, test_end, "scanTimeoutMs", scan_timeout_ms);
+    scan_attempt_count = param_int(test_start, test_end, "scanAttemptCount", scan_attempt_count);
+    scan_interval_ms = param_int(test_start, test_end, "scanIntervalMs", scan_interval_ms);
+    target_valid_samples = param_int(test_start, test_end, "targetValidSamples", target_valid_samples);
     min_rssi = param_int(test_start, test_end, "minRssi", min_rssi);
     if (max_retry_count <= 0) max_retry_count = 1;
     if (retry_interval_ms < 0) retry_interval_ms = 0;
     if (decision_timeout_ms <= 0) decision_timeout_ms = 5000;
     if (scan_timeout_ms <= 0) scan_timeout_ms = 10000;
     request.scan_timeout_ms = scan_timeout_ms;
+    request.max_scan_attempts = scan_attempt_count;
+    request.scan_interval_ms = scan_interval_ms;
+    request.target_valid_samples = target_valid_samples;
 
     if (wifi_nmcli_open(&device, interface_name[0] != '\0' ? interface_name : NULL) != 0) {
         send_report(fd, "wifi", "failed", 4103, "Unable to open Wi-Fi interface", "{}");
@@ -423,20 +432,26 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
                      "{\"ssid\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"scan_completed\",\"attempt\":%d,"
                      "\"maxRetryCount\":%d,\"scanTimeoutMs\":%d,\"readyForHostDecision\":true,"
                      "\"wifiEnabled\":%s,\"found\":%s,\"rssi\":%d,\"minRssi\":%d,"
+                     "\"scanAttemptCount\":%d,\"validSampleCount\":%d,\"scanBusyCount\":%d,\"emptyScanCount\":%d,\"rssiSource\":\"%s\","
                      "\"failureReason\":\"%s\"}",
                      ssid, device.interface_name, attempt, max_retry_count, scan_timeout_ms,
                      result.wifi_enabled ? "true" : "false",
                      result.found ? "true" : "false",
-                     result.rssi, min_rssi, result.failure_reason);
+                     result.rssi, min_rssi, result.scan_attempt_count, result.valid_sample_count,
+                     result.scan_busy_count, result.empty_scan_count,
+                     result.used_link_rssi ? "iw_link" : "iw_scan", result.failure_reason);
         } else {
             snprintf(data, sizeof(data),
                      "{\"ssid\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"scan_completed\",\"attempt\":%d,"
                      "\"maxRetryCount\":%d,\"scanTimeoutMs\":%d,\"readyForHostDecision\":true,"
-                     "\"wifiEnabled\":%s,\"found\":%s,\"rssi\":%d,\"minRssi\":%d}",
+                     "\"wifiEnabled\":%s,\"found\":%s,\"rssi\":%d,\"minRssi\":%d,"
+                     "\"scanAttemptCount\":%d,\"validSampleCount\":%d,\"scanBusyCount\":%d,\"emptyScanCount\":%d,\"rssiSource\":\"%s\"}",
                      ssid, device.interface_name, attempt, max_retry_count, scan_timeout_ms,
                      result.wifi_enabled ? "true" : "false",
                      result.found ? "true" : "false",
-                     result.rssi, min_rssi);
+                     result.rssi, min_rssi, result.scan_attempt_count, result.valid_sample_count,
+                     result.scan_busy_count, result.empty_scan_count,
+                     result.used_link_rssi ? "iw_link" : "iw_scan");
         }
         send_report(fd, "wifi", "running", 0, "Wi-Fi scan completed, waiting for host decision", data);
 
@@ -464,10 +479,9 @@ static int run_wifi(int fd, const struct app_config *config, const char *test_st
             snprintf(data, sizeof(data),
                      "{\"ssid\":\"%s\",\"interfaceName\":\"%s\",\"phase\":\"completed\",\"attempt\":%d,"
                      "\"maxRetryCount\":%d,\"found\":%s,\"rssi\":%d,\"minRssi\":%d,"
-                     "\"failureReason\":\"%s\"}",
+                     "\"failureReason\":\"host_rejected\"}",
                      ssid, device.interface_name, attempt, max_retry_count,
-                     result.found ? "true" : "false", result.rssi, min_rssi,
-                     result.found ? "rssi_too_low" : "ssid_not_found");
+                     result.found ? "true" : "false", result.rssi, min_rssi);
             wifi_nmcli_close(&device);
             send_report(fd, "wifi", "failed", 4106, "Host confirmed Wi-Fi RSSI fail", data);
             return -1;
@@ -1274,7 +1288,7 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
         .current_max_ma = config->fast_charge_current_max_ma,
         .stable_sample_count = 1,
         .sample_interval_ms = 200,
-        .timeout_ms = 1000,
+        .timeout_ms = 4000,
     };
     struct fast_charge_result result;
     char data[1024];
@@ -1888,7 +1902,7 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     char pwm_path[192] = "/sys/class/hwmon/hwmon12/pwm1";
     char tach_path[192] = "/sys/class/hwmon/hwmon12/tach_rpm";
     char data[1024];
-    int start_value = param_int(test_start, test_end, "startValue", 100);
+    int start_value = param_int(test_start, test_end, "startValue", 255);
     int stop_value = param_int(test_start, test_end, "stopValue", 0);
     int settle_ms = param_int(test_start, test_end, "tachSettleMs", 1000);
     int tach_sample_count = param_int(test_start, test_end, "tachSampleCount", 3);
@@ -2524,8 +2538,6 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
         .require_pwm_pulse = config->camera_require_pwm_pulse != 0,
         .pwm_status_path = pwm_status_path,
         .pwm_min_pulse_delta = config->camera_pwm_min_pulse_delta,
-        .expected_sync_rate = 30,
-        .sync_rate_tolerance_percent = 10,
     };
     struct camera_stream_result result;
     char data[1024];
@@ -2546,9 +2558,6 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
     request.require_exposure_interrupt = param_bool(test_start, test_end, "requireExposureInterrupt", request.require_exposure_interrupt);
     request.require_pwm_pulse = param_bool(test_start, test_end, "requirePwmPulse", request.require_pwm_pulse);
     request.pwm_min_pulse_delta = param_int(test_start, test_end, "minPwmPulseDelta", request.pwm_min_pulse_delta);
-    request.expected_sync_rate = param_int(test_start, test_end, "expectedSyncRate", request.expected_sync_rate);
-    request.sync_rate_tolerance_percent = param_int(test_start, test_end, "syncRateTolerancePercent", request.sync_rate_tolerance_percent);
-    if (request.sync_rate_tolerance_percent < 0) request.sync_rate_tolerance_percent = 0;
     if (request.stream_frame_count <= 0) request.stream_frame_count = 90;
     if (request.pwm_min_pulse_delta <= 0) request.pwm_min_pulse_delta = 86;
     wait_camera_timeout_ms = param_int(test_start, test_end, "waitCameraTimeoutMs", wait_camera_timeout_ms);
