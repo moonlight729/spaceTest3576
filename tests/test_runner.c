@@ -337,11 +337,6 @@ static const char *map_vbus_type_name(int vbus_stat)
     }
 }
 
-static int is_external_charger_type(int vbus_stat)
-{
-    return vbus_stat == 0x3 || vbus_stat == 0x4 || vbus_stat == 0x5 || vbus_stat == 0x6;
-}
-
 static int run_board_state(int fd)
 {
     struct board_state state;
@@ -1306,6 +1301,9 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     int vbus_stat = 0;
     int bc12_done = 0;
     int charger_detected = 0;
+    char charger_status_path[256] = "/sys/class/power_supply/bq2579x-charger/status";
+    char required_charger_status[32] = "Charging";
+    char charger_status[64] = "unknown";
     int last_known_charging = 0;
     int last_known_charge_stage = 0;
     int last_known_pmic_status0 = 0;
@@ -1325,6 +1323,8 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     wait_ready_timeout_ms = param_int(test_start, test_end, "waitReadyTimeoutMs", wait_ready_timeout_ms);
     wait_charger_timeout_ms = param_int(test_start, test_end, "waitChargerTimeoutMs", wait_charger_timeout_ms);
     progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", progress_report_interval_ms);
+    param_string(test_start, test_end, "chargerStatusPath", charger_status_path, sizeof(charger_status_path));
+    param_string(test_start, test_end, "requiredStatus", required_charger_status, sizeof(required_charger_status));
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     memset(&result, 0, sizeof(result));
 
@@ -1373,15 +1373,17 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
          * already-inserted charger wait the full 30 seconds. Poll the PMIC
          * during the preparation window and continue immediately once an
          * external charger type is confirmed. */
-        if (read_charge_status_bits(&pmic_status0, &pmic_status1, &vbus_present,
-                                    &pg_stat, &chg_stat, &vbus_stat, &bc12_done) == 0 &&
-            vbus_present && pg_stat && is_external_charger_type(vbus_stat)) {
+        if (read_sysfs_text(charger_status_path, charger_status, sizeof(charger_status)) == 0 &&
+            strcmp(charger_status, required_charger_status) == 0) {
             break;
         }
         snprintf(data, sizeof(data),
                  "{\"phase\":\"wait_manual_charger_insert\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                  "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
+                 "\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\","
+                 "\"detectionSource\":\"power_supply_status\","
                  "\"manualInsertWaitMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
+                 charger_status_path, charger_status, required_charger_status,
                  manual_insert_wait_ms, elapsed_ms, request.timeout_ms);
         send_report(fd, "typec_fast_charge", "running", 0,
                     "Please insert charger before automatic detection starts", data);
@@ -1404,10 +1406,12 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
      * VBUS source instead of SDP/CDP/OTG-only power.
      */
     while (elapsed_ms <= wait_charger_timeout_ms) {
-        if (read_charge_status_bits(&pmic_status0, &pmic_status1, &vbus_present, &pg_stat, &chg_stat, &vbus_stat, &bc12_done) == 0) {
-            if (vbus_present && pg_stat && is_external_charger_type(vbus_stat)) {
+        int status_read_ok = read_sysfs_text(charger_status_path, charger_status, sizeof(charger_status)) == 0;
+        int pmic_read_ok = read_charge_status_bits(&pmic_status0, &pmic_status1, &vbus_present,
+                                                   &pg_stat, &chg_stat, &vbus_stat, &bc12_done) == 0;
+        if (status_read_ok && strcmp(charger_status, required_charger_status) == 0) {
                 charger_detected = 1;
-                last_known_charging = chg_stat != 0;
+                last_known_charging = 1;
                 last_known_charge_stage = chg_stat;
                 last_known_pmic_status0 = pmic_status0;
                 last_known_pmic_status1 = pmic_status1;
@@ -1415,41 +1419,44 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
                 last_known_bc12_done = bc12_done;
                 snprintf(data, sizeof(data),
                          "{\"phase\":\"charger_detected\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
-                         "\"pmicCommunicationOk\":true,\"chargerConnected\":true,\"charging\":%s,\"chargeStage\":\"%s\","
+                         "\"pmicCommunicationOk\":%s,\"chargerConnected\":true,\"charging\":true,\"chargeStage\":\"%s\","
+                         "\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\",\"detectionSource\":\"power_supply_status\","
                          "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
-                         chg_stat != 0 ? "true" : "false",
+                         pmic_read_ok ? "true" : "false",
                          map_charge_stage_name(chg_stat),
+                         charger_status_path, charger_status, required_charger_status,
                          pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done, elapsed_ms, request.timeout_ms);
                 send_report(fd, "typec_fast_charge", "running", 0, "Charger detected, start sampling", data);
                 break;
-            }
-
+        }
+        if (status_read_ok) {
             snprintf(data, sizeof(data),
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
-                     "\"pmicCommunicationOk\":true,\"chargerConnected\":%s,\"charging\":false,\"chargeStage\":\"not_charging\","
+                     "\"pmicCommunicationOk\":%s,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
+                     "\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\",\"detectionSource\":\"power_supply_status\","
                      "\"pmicStatus0\":%d,\"pmicStatus1\":%d,\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
                      "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
-                     is_external_charger_type(vbus_stat) ? "true" : "false",
+                     pmic_read_ok ? "true" : "false", charger_status_path, charger_status, required_charger_status,
                      pmic_status0, pmic_status1, vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
                      wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
-            send_report(fd, "typec_fast_charge", "running", 0,
-                        is_external_charger_type(vbus_stat) ? "Waiting for charger stabilization" : "Waiting for external charger, OTG power does not count",
-                        data);
+            send_report(fd, "typec_fast_charge", "running", 0, "Waiting for charger status Charging", data);
         } else {
             snprintf(data, sizeof(data),
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                      "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"unknown\","
                      "\"vbusType\":\"unknown\",\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d}",
                      wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
-            send_report(fd, "typec_fast_charge", "running", 0, "Waiting for charger, PMIC status read retrying", data);
+            send_report(fd, "typec_fast_charge", "running", 0, "Waiting for charger status file read retry", data);
         }
 
         if (elapsed_ms >= wait_charger_timeout_ms) {
             snprintf(data, sizeof(data),
                      "{\"phase\":\"wait_charger\",\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":true,"
                      "\"pmicCommunicationOk\":true,\"chargerConnected\":false,\"charging\":false,\"chargeStage\":\"not_charging\","
+                     "\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\",\"detectionSource\":\"power_supply_status\","
                      "\"vbusStat\":%d,\"vbusType\":\"%s\",\"bc12Done\":%d,"
                      "\"waitChargerTimeoutMs\":%d,\"elapsedMs\":%d,\"samplingDurationMs\":%d,\"failureReason\":\"charger_insert_timeout\"}",
+                     charger_status_path, charger_status, required_charger_status,
                      vbus_stat, map_vbus_type_name(vbus_stat), bc12_done,
                      wait_charger_timeout_ms, elapsed_ms, request.timeout_ms);
             return send_report(fd, "typec_fast_charge", "failed", 4405, "Charger insert timeout", data);
