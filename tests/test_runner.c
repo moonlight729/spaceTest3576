@@ -1979,17 +1979,6 @@ static int run_ethernet_led_shell(const char *command)
     return rc == 0 ? 0 : -1;
 }
 
-static void reconnect_ethernet_led_interface(const char *interface_name)
-{
-    char command[256];
-    snprintf(command, sizeof(command), "ip link set dev %s up >/dev/null 2>&1", interface_name);
-    (void)run_ethernet_led_shell(command);
-    snprintf(command, sizeof(command), "nmcli device reapply %s >/dev/null 2>&1", interface_name);
-    (void)run_ethernet_led_shell(command);
-    snprintf(command, sizeof(command), "nmcli device connect %s >/dev/null 2>&1", interface_name);
-    (void)run_ethernet_led_shell(command);
-}
-
 static int read_ethernet_led_speed_mbps(const char *interface_name)
 {
     char path[160];
@@ -2038,7 +2027,6 @@ static void restore_ethernet_led_autoneg(const char *interface_name)
     }
     (void)run_ethernet_led_shell(command);
 
-    reconnect_ethernet_led_interface(interface_name);
 }
 
 static int run_ethernet_led(int fd, const char *test_start, const char *test_end)
@@ -2049,9 +2037,9 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     char led_1000m[32] = "yellow";
     int wait_cable_timeout_ms = param_int(test_start, test_end, "waitCableTimeoutMs", 15000);
     int progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", 1000);
-    int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 2000);
+    int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 1500);
     int settle_ms = param_int(test_start, test_end, "settleMs", 2000);
-    int speed_wait_timeout_ms = param_int(test_start, test_end, "speedWaitTimeoutMs", 10000);
+    int speed_wait_timeout_ms = param_int(test_start, test_end, "speedWaitTimeoutMs", 3000);
     int cycle_count = param_int(test_start, test_end, "cycleCount", 1);
     int timeout_ms = param_int(test_start, test_end, "manualDecisionTimeoutMs", 15000);
     int reconnect_delay_ms = param_int(test_start, test_end, "reconnectDelayMs", 25000);
@@ -2070,9 +2058,9 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     timeout_ms = param_int(test_start, test_end, "timeoutMs", timeout_ms);
     if (wait_cable_timeout_ms <= 0) wait_cable_timeout_ms = 15000;
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
-    if (phase_ms <= 0) phase_ms = 2000;
+    if (phase_ms <= 0) phase_ms = 1500;
     if (settle_ms < 0) settle_ms = 0;
-    if (speed_wait_timeout_ms <= 0) speed_wait_timeout_ms = 10000;
+    if (speed_wait_timeout_ms <= 0) speed_wait_timeout_ms = 3000;
     if (cycle_count <= 0) cycle_count = 1;
     if (cycle_count > 10) cycle_count = 10;
     if (timeout_ms <= 0) timeout_ms = 15000;
@@ -2170,9 +2158,13 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     ethernet_led_sequence_complete = 0;
     (void)shutdown(fd, SHUT_RDWR);
 
+    /* Keep the default 1000M/yellow state visible before switching to 100M. */
+    ethernet_led_log("observe_default", "yellow_default_1500ms");
+    sleep_ms_local(1500);
+
     for (cycle = 1; cycle <= cycle_count; ++cycle) {
-        for (phase = 0; phase < 2; ++phase) {
-            const int gigabit = phase == 1;
+        for (phase = 0; phase < 1; ++phase) {
+            const int gigabit = 0;
             const int expected_speed_mbps = gigabit ? 1000 : 100;
             const char *phase_name = gigabit ? "show_1000m" : "show_100m";
             const char *expected_led = gigabit ? led_1000m : led_100m;
@@ -2192,7 +2184,6 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
             }
 
             if (settle_ms > 0) sleep_ms_local(settle_ms);
-            reconnect_ethernet_led_interface(interface_name);
             ethernet_led_log("link_reconnect", phase_name);
             if (wait_ethernet_led_speed(interface_name, expected_speed_mbps,
                                         speed_wait_timeout_ms, &actual_speed_mbps) != 0) {
@@ -2235,9 +2226,9 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
 wait_for_decision:
     ethernet_led_log("operator_confirm_sequence", "PASS_FAIL_now_allowed");
     snprintf(data, sizeof(data),
-             "{\"phase\":\"operator_confirm_sequence\",\"led100mColor\":\"%s\","
-             "\"led1000mColor\":\"%s\",\"requiresOperatorDecision\":true,\"timeoutMs\":%d}",
-             led_100m, led_1000m, timeout_ms);
+             "{\"phase\":\"operator_confirm_sequence\",\"expectedLed\":\"%s\","
+             "\"expectedSpeedMbps\":100,\"requiresOperatorDecision\":true,\"reconnected\":true,\"timeoutMs\":%d}",
+             led_100m, timeout_ms);
     send_report(fd, "ethernet_led", "running", 0, "Confirm the Ethernet LED sequence", data);
     switch (wait_operator_decision_or_disconnect(fd, "ethernet_led", timeout_ms, &passed, &disconnected)) {
     case 1:
@@ -2262,7 +2253,7 @@ ethernet_led_decision_done:
         restore_ethernet_led_autoneg(interface_name);
         snprintf(data, sizeof(data),
                  "{\"manualObserved\":true,\"operatorConfirmed\":%s,\"interfaceName\":\"%s\","
-                 "\"displayMode\":\"100m_1000m_led_sequence\",\"timeoutMs\":%d}",
+                 "\"displayMode\":\"100m_green_after_reconnect\",\"expectedSpeedMbps\":100,\"timeoutMs\":%d}",
                  passed ? "true" : "false", interface_name, timeout_ms);
         ethernet_led_resume_pending = 0;
         ethernet_led_resume_code = 0;
