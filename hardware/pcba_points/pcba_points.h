@@ -1,5 +1,5 @@
-#ifndef SPACETEST3576_PCBA_POINTS_FILE_H
-#define SPACETEST3576_PCBA_POINTS_FILE_H
+#ifndef SPACETEST3576_PCBA_POINTS_H
+#define SPACETEST3576_PCBA_POINTS_H
 
 struct pcba_points_request {
     const char *record_file;
@@ -11,6 +11,7 @@ struct pcba_points_request {
 
 struct pcba_point_value {
     int index;
+    char name[32];
     int voltage_mv;
     int min_mv;
     int max_mv;
