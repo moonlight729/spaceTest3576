@@ -36,6 +36,10 @@ static int control_gen1_app_service(const char *action)
     if (action == NULL || (strcmp(action, "stop") != 0 && strcmp(action, "start") != 0)) return -1;
     snprintf(command, sizeof(command), "sudo -n systemctl %s gen1-app.service", action);
     rc = system(command);
+    if (rc == 1280) {
+        fprintf(stderr, "[SERVICE] gen1-app.service not installed; skip %s\n", action);
+        return 0;
+    }
     fprintf(stderr, "[SERVICE] %s rc=%d\n", command, rc);
     return rc == 0 ? 0 : -1;
 }
