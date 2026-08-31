@@ -11,7 +11,7 @@
 #include "../hardware/tf_card/tf_card.h"
 #include "../hardware/usb3.0/usb3_file_check.h"
 #include "../hardware/usb/usb_insert_test.h"
-#include "../hardware/pcba_points/pcba_points.h"
+#include "../hardware/pcba_points/pcba_points_file.h"
 #include "../hardware/wifi/wifi_nmcli.h"
 #include "../protocol/protocol.h"
 #include "../storage/board_state.h"
@@ -33,6 +33,27 @@
 #define CHARGE_CURRENT_LIMIT_500MA_COMMAND "i2ctransfer -f -y 7 w3@0x6b 0x03 0x00 0x32"
 #define CHARGE_CURRENT_LIMIT_MA 500
 #define PMIC_STATUS0_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1b r1"
+
+static int control_gen1_app_service(const char *action, int *was_stopped)
+{
+    char command[128];
+    int rc;
+    if (was_stopped != NULL) *was_stopped = 0;
+    if (action == NULL) return -1;
+    snprintf(command, sizeof(command), "sudo -n systemctl %s gen1-app.service", action);
+    rc = system(command);
+    if (rc == 0) {
+        if (was_stopped != NULL && strcmp(action, "stop") == 0) *was_stopped = 1;
+        fprintf(stderr, "[SERVICE] %s succeeded\n", command);
+        return 0;
+    }
+    if (rc == 1280) {
+        fprintf(stderr, "[SERVICE] gen1-app.service not installed; skip %s\n", action);
+        return 0;
+    }
+    fprintf(stderr, "[SERVICE] %s failed rc=%d\n", command, rc);
+    return -1;
+}
 #define PMIC_STATUS1_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1c r1"
 
 static int wait_test_decision(int fd, const char *test_id, int timeout_ms, int *passed);
@@ -790,7 +811,7 @@ static int run_usb2_3(int fd, const char *test_start, const char *test_end)
     return run_usb_variant(fd, test_start, test_end, 3);
 }
 
-static void __attribute__((unused)) append_pcba_points_json(char *data, size_t data_size,
+static void append_pcba_points_json(char *data, size_t data_size,
                                     const struct pcba_points_result *result,
                                     int include_all_points)
 {
@@ -812,9 +833,9 @@ static void __attribute__((unused)) append_pcba_points_json(char *data, size_t d
     if (include_all_points) {
         for (i = 0; i < result->parsed_count && i < 32; ++i) {
             snprintf(data + used, data_size - used,
-                     "%s{\"index\":%d,\"name\":\"%s\",\"voltageMv\":%d,\"minMv\":%d,\"maxMv\":%d,\"passed\":%s}",
+                     "%s{\"index\":%d,\"name\":\"TP%02d\",\"voltageMv\":%d,\"minMv\":%d,\"maxMv\":%d,\"passed\":%s}",
                      i == 0 ? "" : ",",
-                     result->points[i].index, result->points[i].name,
+                     result->points[i].index, result->points[i].index,
                      result->points[i].voltage_mv, result->points[i].min_mv,
                      result->points[i].max_mv, result->points[i].passed ? "true" : "false");
             used = strnlen(data, data_size);
@@ -825,28 +846,39 @@ static void __attribute__((unused)) append_pcba_points_json(char *data, size_t d
 
 static int run_pcba_test_points(int fd, const char *test_start, const char *test_end)
 {
-    int timeout_ms = param_int(test_start, test_end, "timeoutMs", 30000);
-    int passed = 0;
-    char data[512];
-    snprintf(data, sizeof(data), "{\"channelCount\":32,\"readyForHostDecision\":true}");
-    send_report(fd, "pcba_test_points", "running", 0,
-                "Waiting for host JX-TVM voltage measurement", data);
-    switch (wait_test_decision(fd, "pcba_test_points", timeout_ms, &passed)) {
-    case 1:
-        send_report(fd, "pcba_test_points", passed ? "passed" : "failed",
-                    passed ? 0 : 5003,
-                    passed ? "PCBA test point voltages are in range" : "PCBA test point voltage is out of range",
+    char record_file[160] = "/tmp/spacetest_pcba_points.json";
+    struct pcba_points_request request = {
+        .record_file = record_file,
+        .channel_count = 32,
+        .default_min_mv = 0,
+        .default_max_mv = 5000,
+        .timeout_ms = 5000
+    };
+    struct pcba_points_result result;
+    char data[8192];
+
+    param_string(test_start, test_end, "recordFile", record_file, sizeof(record_file));
+    request.channel_count = param_int(test_start, test_end, "channelCount", request.channel_count);
+    request.default_min_mv = param_int(test_start, test_end, "defaultMinMv", request.default_min_mv);
+    request.default_max_mv = param_int(test_start, test_end, "defaultMaxMv", request.default_max_mv);
+    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+
+    snprintf(data, sizeof(data),
+             "{\"recordFile\":\"%s\",\"channelCount\":%d,\"defaultMinMv\":%d,\"defaultMaxMv\":%d}",
+             record_file, request.channel_count, request.default_min_mv, request.default_max_mv);
+    send_report(fd, "pcba_test_points", "running", 0, "Read PCBA test point voltages", data);
+
+    if (pcba_points_run_test(&request, &result) != 0) {
+        append_pcba_points_json(data, sizeof(data), &result, 1);
+        send_report(fd, "pcba_test_points", "failed",
+                    result.error_code == 0 ? 5000 : result.error_code,
+                    result.message[0] == '\0' ? "PCBA test point check failed" : result.message,
                     data);
-        return passed ? 0 : -1;
-    case 0:
-        send_report(fd, "pcba_test_points", "failed", 5001,
-                    "Host JX-TVM measurement timed out", data);
-        return -1;
-    default:
-        send_report(fd, "pcba_test_points", "failed", 5000,
-                    "Host JX-TVM measurement communication failed", data);
         return -1;
     }
+
+    append_pcba_points_json(data, sizeof(data), &result, 1);
+    return send_report(fd, "pcba_test_points", "passed", 0, result.message, data);
 }
 
 static int read_text_file_trimmed(const char *path, char *buffer, size_t buffer_size)
@@ -2530,6 +2562,7 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
     };
     struct camera_stream_result result;
     char data[1024];
+    int gen1_stopped = 0;
 
     snprintf(device_path, sizeof(device_path), "%s", config->camera_device_path);
     exposure_counter_path[0] = '\0';
@@ -2580,7 +2613,14 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
              device_path, wait_camera_timeout_ms, elapsed_ms);
     send_report(fd, "typec_camera", "running", 0, "Camera detected, starting stream test", data);
 
+    if (control_gen1_app_service("stop", &gen1_stopped) != 0) {
+        send_report(fd, "typec_camera", "failed", 4710,
+                    "Unable to stop gen1 application service", "{\"phase\":\"service_stop\"}");
+        return -1;
+    }
+
     if (camera_stream_run_test(&request, &result) != 0) {
+        if (gen1_stopped) control_gen1_app_service("start", NULL);
         snprintf(data, sizeof(data),
                  "{\"phase\":\"failed\",\"device\":\"%s\",\"capturedFrames\":%d,\"exposureDelta\":%d,"
                  "\"pwmStatusPath\":\"%s\",\"pwmPulseCountBefore\":%llu,\"pwmPulseCountAfter\":%llu,"
@@ -2599,6 +2639,11 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
                     result.error_code == 0 ? 4700 : result.error_code,
                     result.message[0] == '\0' ? "Camera stream test failed" : result.message,
                     data);
+        return -1;
+    }
+    if (gen1_stopped && control_gen1_app_service("start", NULL) != 0) {
+        send_report(fd, "typec_camera", "failed", 4711,
+                    "Unable to restart gen1 application service", "{\"phase\":\"service_start\"}");
         return -1;
     }
     snprintf(data, sizeof(data),
