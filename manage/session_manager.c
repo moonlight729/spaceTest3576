@@ -29,6 +29,17 @@ static int pressure_load_error_count = 0;
 static int send_failure(int fd, const char *session_id, int code, const char *message);
 static int send_ok_response(int fd, const char *session_id, const char *message);
 
+static int control_gen1_app_service(const char *action)
+{
+    char command[128];
+    int rc;
+    if (action == NULL || (strcmp(action, "stop") != 0 && strcmp(action, "start") != 0)) return -1;
+    snprintf(command, sizeof(command), "sudo -n systemctl %s gen1-app.service", action);
+    rc = system(command);
+    fprintf(stderr, "[SERVICE] %s rc=%d\n", command, rc);
+    return rc == 0 ? 0 : -1;
+}
+
 struct pressure_worker_args { int is_cpu; struct pressure_stress_result *result; int rc; };
 static void *run_pressure_worker(void *argument)
 {
@@ -372,6 +383,9 @@ static int handle_sync_session_summary(int fd, const struct protocol_request *re
     if (board_state_write_last_result_json(config->board_state_path, request->session_id, verdict, items, item_count) != 0) {
         return send_failure(fd, request->session_id, 2204, "Unable to save last result detail");
     }
+    if (control_gen1_app_service("start") != 0) {
+        return send_failure(fd, request->session_id, 2205, "Unable to restart gen1 application service");
+    }
     return send_ok_response(fd, request->session_id, "Session summary synced");
 }
 
@@ -380,6 +394,9 @@ static int send_board_state(int fd, const char *session_id, const struct app_con
     struct board_state state;
     char data[4096];
     char line[4608];
+    if (control_gen1_app_service("stop") != 0) {
+        return send_failure(fd, session_id, 2206, "Unable to stop gen1 application service for testing");
+    }
     if (config == NULL || board_state_load_from_file(config->board_state_path, &state) != 0) {
         board_state_load_defaults(&state);
     }
