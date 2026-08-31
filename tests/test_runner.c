@@ -2509,6 +2509,8 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
     return send_report(fd, "keys", "passed", 0, "Five-key test passed", data);
 }
 
+static int ensure_gen1_service_stopped(void) { int rc = system("systemctl cat gen1-app.service"); if (rc != 0) return 0; if (system("systemctl stop gen1-app.service") != 0) return -1; rc = system("systemctl is-active --quiet gen1-app.service"); return rc == 0 ? -1 : 0; }
+
 static int run_camera(int fd, const struct app_config *config, const char *test_start, const char *test_end)
 {
     char device_path[128];
@@ -2578,6 +2580,7 @@ static int run_camera(int fd, const struct app_config *config, const char *test_
              "{\"phase\":\"camera_detected\",\"device\":\"%s\",\"cameraPresent\":true,"
              "\"requiresCameraInsert\":false,\"waitCameraTimeoutMs\":%d,\"elapsedMs\":%d}",
              device_path, wait_camera_timeout_ms, elapsed_ms);
+    if (ensure_gen1_service_stopped() != 0) return send_report(fd, "typec_camera", "failed", 4707, "Unable to stop gen1 application service before camera test", "{}");
     send_report(fd, "typec_camera", "running", 0, "Camera detected, starting stream test", data);
 
     if (camera_stream_run_test(&request, &result) != 0) {
