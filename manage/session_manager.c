@@ -324,6 +324,58 @@ static int send_application_md5(int fd, const char *session_id, const struct app
     return protocol_write_line(fd, response);
 }
 
+static int send_versions(int fd, const struct protocol_request *r)
+{
+    char uboot[128] = "unknown";
+    char kernel[128] = "unknown";
+    char rootfs[64] = "unknown";
+    char line[256];
+
+    FILE *pipe = popen("version 2>/dev/null", "r");
+    if (pipe != NULL) {
+        while (fgets(line, sizeof(line), pipe) != NULL) {
+            char *value = strchr(line, ':');
+            if (value == NULL) {
+                continue;
+            }
+
+            *value++ = '\0';
+            while (*value == ' ' || *value == '\t') {
+                value++;
+            }
+
+            if (strstr(line, "uboot") != NULL) {
+                snprintf(uboot, sizeof(uboot), "%s", value);
+            } else if (strstr(line, "kernel") != NULL) {
+                snprintf(kernel, sizeof(kernel), "%s", value);
+            }
+        }
+
+        pclose(pipe);
+    }
+
+    char data[512];
+    snprintf(
+        data,
+        sizeof(data),
+        "{\"ubootVersion\":\"%s\",\"kernelVersion\":\"%s\","
+        "\"rootfsVersion\":\"%s\"}",
+        uboot,
+        kernel,
+        rootfs);
+
+    char response[768];
+    protocol_build_response_envelope(
+        response,
+        sizeof(response),
+        r->session_id,
+        0,
+        "Versions read",
+        data);
+
+    return protocol_write_line(fd, response);
+}
+
 static int send_application_version(int fd, const char *session_id, const struct app_config *config)
 {
     char data[512];
@@ -462,6 +514,9 @@ int session_manager_handle_client(int client_fd, const struct app_config *config
     }
     if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "get_version") == 0) {
         return send_application_version(client_fd, request.session_id, config);
+    }
+    if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "get_versions") == 0) {
+        return send_versions(client_fd, &request);
     }
     if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "write_sn") == 0) {
         return write_board_sn(client_fd, &request);
