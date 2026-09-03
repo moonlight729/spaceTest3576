@@ -2264,9 +2264,45 @@ static int run_finished_product_indicator_led(int fd, const char *test_start, co
     int red_green_overlap_ms = param_int(test_start, test_end, "redGreenOverlapMs", 200);
     int i2c_timeout_ms = param_int(test_start, test_end, "i2cTimeoutMs", 3000);
     int retry_interval_ms = param_int(test_start, test_end, "i2cRetryIntervalMs", 100);
+    /* Zero means wait indefinitely: inserting the cable must allow the
+       current LED test to continue without rescanning the SN. */
+    int charger_wait_timeout_ms = param_int(test_start, test_end, "chargerCheckTimeoutMs", 0);
+    int charger_poll_interval_ms = param_int(test_start, test_end, "chargerCheckPollIntervalMs", 250);
+    char charger_status_path[256] = "/sys/class/power_supply/bq2579x-charger/status";
+    char required_charger_status[32] = "Charging";
+    char charger_status[64] = "unknown";
     char data[512];
     int elapsed_ms = 0;
     int phase;
+
+    param_string(test_start, test_end, "chargerStatusPath", charger_status_path, sizeof(charger_status_path));
+    param_string(test_start, test_end, "chargerRequiredStatus", required_charger_status, sizeof(required_charger_status));
+    if (charger_wait_timeout_ms < 0) charger_wait_timeout_ms = 0;
+    if (charger_poll_interval_ms < 50) charger_poll_interval_ms = 50;
+    /* The LED board is powered through the charger path.  Check it before
+       changing any LED/PMIC state; this applies to both PCBA and finished
+       product modes because they share this runner. */
+    int charger_elapsed_ms = 0;
+    while (1) {
+        int read_ok = read_sysfs_text(charger_status_path, charger_status, sizeof(charger_status)) == 0;
+        if (read_ok && strcmp(charger_status, required_charger_status) == 0) break;
+        if (charger_wait_timeout_ms > 0 && charger_elapsed_ms >= charger_wait_timeout_ms) {
+            snprintf(data, sizeof(data),
+                     "{\"chargerConnected\":false,\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\",\"failureReason\":\"charger_not_connected\"}",
+                     charger_status_path, charger_status, required_charger_status);
+            send_report(fd, "indicator_led", "failed", 4603,
+                        "Please connect charger cable before indicator LED test", data);
+            return -1;
+        }
+        snprintf(data, sizeof(data),
+                 "{\"phase\":\"wait_charger\",\"chargerConnected\":false,\"chargerStatusPath\":\"%s\",\"chargerStatus\":\"%s\",\"requiredStatus\":\"%s\",\"elapsedMs\":%d,\"timeoutMs\":%d}",
+                 charger_status_path, charger_status, required_charger_status,
+                 charger_elapsed_ms, charger_wait_timeout_ms);
+        send_report(fd, "indicator_led", "running", 0,
+                    "Please connect charger cable before indicator LED test", data);
+        sleep_ms_local(charger_poll_interval_ms);
+        charger_elapsed_ms += charger_poll_interval_ms;
+    }
 
     if (timeout_ms < 30000) timeout_ms = 30000;
     if (indicator_led_open(&device) != 0) {
