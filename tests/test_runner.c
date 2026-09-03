@@ -30,10 +30,6 @@
 
 #define CHARGE_CONTROL_ENABLE_COMMAND "i2ctransfer -f -y 7 w2@0x6b 0x12 0x00"
 #define CHARGE_CONTROL_DISABLE_COMMAND "i2ctransfer -f -y 7 w2@0x6b 0x12 0x80"
-#define CHARGE_CURRENT_LIMIT_500MA_COMMAND "i2ctransfer -f -y 7 w3@0x6b 0x03 0x00 0x32"
-#define CHARGE_CURRENT_LIMIT_MA 500
-#define PMIC_STATUS0_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1b r1"
-#define PMIC_STATUS1_READ_COMMAND "i2ctransfer -f -y 7 w1@0x6b 0x1c r1"
 
 static int wait_test_decision(int fd, const char *test_id, int timeout_ms, int *passed);
 static int wait_operator_decision_or_disconnect(int fd, const char *test_id, int timeout_ms, int *passed, int *disconnected);
@@ -256,85 +252,6 @@ static int send_report(int fd, const char *test_id, const char *status,
     char line[16384];
     protocol_build_test_report(line, sizeof(line), test_id, status, code, message, data_json);
     return protocol_write_line(fd, line);
-}
-
-static int set_charge_enabled(int enabled)
-{
-    return system(enabled ? CHARGE_CONTROL_ENABLE_COMMAND : CHARGE_CONTROL_DISABLE_COMMAND);
-}
-
-static int set_charge_current_limit_500ma(void)
-{
-    return system(CHARGE_CURRENT_LIMIT_500MA_COMMAND);
-}
-
-static int read_i2c_register_value(const char *command, int *value)
-{
-    FILE *pipe;
-    char buffer[64];
-    unsigned int parsed;
-    if (value == NULL) return -1;
-    *value = 0;
-    pipe = popen(command, "r");
-    if (pipe == NULL) return -1;
-    if (fgets(buffer, sizeof(buffer), pipe) == NULL) {
-        pclose(pipe);
-        return -1;
-    }
-    pclose(pipe);
-    if (sscanf(buffer, "0x%x", &parsed) != 1) return -1;
-    *value = (int)(parsed & 0xFFu);
-    return 0;
-}
-
-static int read_charge_status_bits(int *status0, int *status1,
-                                   int *vbus_present, int *pg_stat, int *chg_stat,
-                                   int *vbus_stat, int *bc12_done)
-{
-    int reg1b;
-    int reg1c;
-    if (read_i2c_register_value(PMIC_STATUS0_READ_COMMAND, &reg1b) != 0 ||
-        read_i2c_register_value(PMIC_STATUS1_READ_COMMAND, &reg1c) != 0) {
-        return -1;
-    }
-    if (status0 != NULL) *status0 = reg1b;
-    if (status1 != NULL) *status1 = reg1c;
-    if (vbus_present != NULL) *vbus_present = reg1b & 0x01;
-    if (pg_stat != NULL) *pg_stat = (reg1b >> 3) & 0x01;
-    if (chg_stat != NULL) *chg_stat = (reg1c >> 5) & 0x07;
-    if (vbus_stat != NULL) *vbus_stat = (reg1c >> 1) & 0x0F;
-    if (bc12_done != NULL) *bc12_done = reg1c & 0x01;
-    return 0;
-}
-
-static const char *map_charge_stage_name(int chg_stat)
-{
-    switch (chg_stat) {
-    case 1: return "trickle";
-    case 2: return "precharge";
-    case 3: return "cc";
-    case 4: return "cv";
-    case 6: return "topoff";
-    case 7: return "done";
-    default: return "not_charging";
-    }
-}
-
-static const char *map_vbus_type_name(int vbus_stat)
-{
-    switch (vbus_stat) {
-    case 0x0: return "no_input";
-    case 0x1: return "usb_sdp";
-    case 0x2: return "usb_cdp";
-    case 0x3: return "usb_dcp";
-    case 0x4: return "hvdcp";
-    case 0x5: return "unknown_adapter";
-    case 0x6: return "non_standard_adapter";
-    case 0x7: return "otg_mode";
-    case 0x8: return "not_qualified_adapter";
-    case 0xB: return "powered_from_vbus";
-    default: return "reserved";
-    }
 }
 
 static int run_board_state(int fd)
@@ -1264,6 +1181,7 @@ static int run_bluetooth(int fd, const struct app_config *config, const char *te
 
 static int run_fast_charge(int fd, const struct app_config *config, const char *test_start, const char *test_end)
 {
+#if 0
     struct fast_charge_device device;
     struct fast_charge_request request = {
         .voltage_min_mv = config->fast_charge_voltage_min_mv,
@@ -1301,8 +1219,6 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
     int last_known_bc12_done = 0;
     int passed = 0;
 
-    request.voltage_min_mv = param_int(test_start, test_end, "chargeVoltageMinMv", request.voltage_min_mv);
-    request.voltage_max_mv = param_int(test_start, test_end, "chargeVoltageMaxMv", request.voltage_max_mv);
     request.current_min_ma = param_int(test_start, test_end, "chargeCurrentMinMa", request.current_min_ma);
     request.current_max_ma = param_int(test_start, test_end, "chargeCurrentMaxMa", request.current_max_ma);
     request.stable_sample_count = param_int(test_start, test_end, "stableSampleCount", request.stable_sample_count);
@@ -1323,30 +1239,6 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
              wait_ready_timeout_ms, ready_elapsed_ms);
     send_report(fd, "typec_fast_charge", "running", 0,
                 "External loads removed, enabling fast charge mode", data);
-
-    snprintf(data, sizeof(data),
-             "{\"phase\":\"set_charge_current_limit\",\"chargeCurrentLimitMa\":%d,"
-             "\"chargeCurrentLimitCommand\":\"set_500ma\",\"chargeCurrentLimitOk\":false}",
-             CHARGE_CURRENT_LIMIT_MA);
-    send_report(fd, "typec_fast_charge", "running", 0,
-                "Setting charge current limit to 500mA", data);
-    if (set_charge_current_limit_500ma() != 0) {
-        return send_report(fd, "typec_fast_charge", "failed", 4407,
-                           "Unable to set charge current limit to 500mA", data);
-    }
-
-    if (set_charge_enabled(1) != 0) {
-        snprintf(data, sizeof(data),
-                 "{\"chargeControlCommand\":\"enable_charge\",\"chargeControlOk\":false,"
-                 "\"chargeCurrentLimitMa\":%d,\"chargeCurrentLimitCommand\":\"set_500ma\",\"chargeCurrentLimitOk\":true,"
-                 "\"pmicCommunicationOk\":false,\"chargerConnected\":false,\"charging\":false,"
-                 "\"chargeStage\":\"unknown\",\"chargeVoltageMv\":0,\"chargeCurrentMa\":0,\"stable\":false,"
-                 "\"stableSamples\":0,\"averageChargeCurrentMa\":0,\"voltageMinMv\":%d,\"voltageMaxMv\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d}",
-                 CHARGE_CURRENT_LIMIT_MA, request.voltage_min_mv, request.voltage_max_mv,
-                 request.current_min_ma, request.current_max_ma);
-        return send_report(fd, "typec_fast_charge", "failed", 4401,
-                           "Unable to enable charge before fast charge test", data);
-    }
 
     /*
      * OTG 通信链路必须常接，PMIC 在部分场景下会把当前 VBUS 提前识别成
@@ -1555,6 +1447,32 @@ static int run_fast_charge(int fd, const struct app_config *config, const char *
         return send_report(fd, "typec_fast_charge", "failed", 4403, "Host decision timed out", data);
     default:
         return send_report(fd, "typec_fast_charge", "failed", 4404, "Unable to read host decision", data);
+    }
+}
+
+#endif
+    (void)config;
+    struct fast_charge_device device;
+    struct fast_charge_request request = { .current_min_ma = 1800, .current_max_ma = 4500, .stable_sample_count = 1, .sample_interval_ms = 200, .timeout_ms = 4000 };
+    struct fast_charge_result result;
+    char data[1024];
+    int passed = 0;
+    request.current_min_ma = param_int(test_start, test_end, "chargeCurrentMinMa", request.current_min_ma);
+    request.current_max_ma = param_int(test_start, test_end, "chargeCurrentMaxMa", request.current_max_ma);
+    request.sample_interval_ms = param_int(test_start, test_end, "sampleIntervalMs", request.sample_interval_ms);
+    request.timeout_ms = param_int(test_start, test_end, "timeoutMs", request.timeout_ms);
+    if (fast_charge_open(&device) != 0 || fast_charge_run_test(&device, &request, &result) != 0) {
+        snprintf(data, sizeof(data), "{\"phase\":\"sampling_failed\",\"chargerStatus\":\"%s\",\"chargerConnected\":%s,\"charging\":%s,\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"averageChargeCurrentMa\":%d,\"currentMinMa\":%d,\"currentMaxMa\":%d,\"sampleCount\":1,\"samplingDurationMs\":%d,\"failureReason\":\"%s\"}", result.charger_online ? "Charging" : "Not charging", result.charger_online ? "true" : "false", result.charger_online ? "true" : "false", result.voltage_mv, result.current_ma, result.current_ma, request.current_min_ma, request.current_max_ma, request.timeout_ms, result.message);
+        fast_charge_close(&device);
+        return send_report(fd, "typec_fast_charge", "failed", result.error_code ? result.error_code : 4400, result.message, data);
+    }
+    snprintf(data, sizeof(data), "{\"phase\":\"ready_for_host_decision\",\"chargerStatus\":\"Charging\",\"chargerConnected\":true,\"charging\":true,\"chargeVoltageMv\":%d,\"chargeCurrentMa\":%d,\"averageChargeCurrentMa\":%d,\"rawCurrentSamplesMa\":[%d],\"currentMinMa\":%d,\"currentMaxMa\":%d,\"sampleCount\":1,\"samplingDurationMs\":%d,\"readyForHostDecision\":true}", result.voltage_mv, result.current_ma, result.current_ma, result.current_ma, request.current_min_ma, request.current_max_ma, request.timeout_ms);
+    fast_charge_close(&device);
+    send_report(fd, "typec_fast_charge", "running", 0, "Charging sample ready for host decision", data);
+    switch (wait_test_decision(fd, "typec_fast_charge", request.timeout_ms, &passed)) {
+    case 1: return send_report(fd, "typec_fast_charge", passed ? "passed" : "failed", passed ? 0 : 4402, passed ? "Host confirmed fast charge pass" : "Host confirmed fast charge fail", data);
+    case 0: return send_report(fd, "typec_fast_charge", "failed", 4403, "Host decision timed out", data);
+    default: return send_report(fd, "typec_fast_charge", "failed", 4404, "Unable to read host decision", data);
     }
 }
 

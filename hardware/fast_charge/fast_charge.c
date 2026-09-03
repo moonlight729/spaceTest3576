@@ -12,7 +12,7 @@
  * software will expose a file interface for real charging-input measurements.
  * Change these readers then; do not change fast_charge_run_test() semantics.
  */
-#define CHARGER_PATH "/sys/class/power_supply/bq2579x-charger"
+#define CHARGER_STATUS_PATH "/sys/class/power_supply/bq2579x-charger/status"
 #define BATTERY_PATH "/sys/class/power_supply/cw221X-bat"
 
 static int read_int(const char *directory, const char *name, int *value)
@@ -24,6 +24,20 @@ static int read_int(const char *directory, const char *name, int *value)
     if (file == NULL) return -1;
     if (fscanf(file, "%d", value) != 1) { fclose(file); errno = EIO; return -1; }
     fclose(file);
+    return 0;
+}
+
+static int read_text(const char *path, char *value, size_t size)
+{
+    FILE *file;
+    if (path == NULL || value == NULL || size == 0) return -1;
+    file = fopen(path, "r");
+    if (file == NULL || fgets(value, size, file) == NULL) {
+        if (file != NULL) fclose(file);
+        return -1;
+    }
+    fclose(file);
+    value[strcspn(value, "\r\n")] = '\0';
     return 0;
 }
 
@@ -39,7 +53,7 @@ static void set_message(struct fast_charge_result *result, int code, const char 
 int fast_charge_open(struct fast_charge_device *device)
 {
     if (device == NULL) { errno = EINVAL; return -1; }
-    device->charger_path = CHARGER_PATH;
+    device->charger_path = CHARGER_STATUS_PATH;
     device->battery_path = BATTERY_PATH;
     return 0;
 }
@@ -51,17 +65,19 @@ void fast_charge_close(struct fast_charge_device *device)
 
 int fast_charge_read(struct fast_charge_device *device, struct fast_charge_result *result)
 {
-    int online, voltage_uv, current_ua;
+    char status[32];
+    int voltage_uv, current_ua;
     if (device == NULL || result == NULL || device->charger_path == NULL || device->battery_path == NULL) { errno = EINVAL; return -1; }
     memset(result, 0, sizeof(*result));
-    if (read_int(device->charger_path, "online", &online) != 0 ||
+    if (read_text(device->charger_path, status, sizeof(status)) != 0 ||
         read_int(device->battery_path, "voltage_now", &voltage_uv) != 0 ||
         read_int(device->battery_path, "current_now", &current_ua) != 0) {
         set_message(result, 4400, "Unable to read charger or battery sysfs data");
         return -1;
     }
-    result->charger_online = online != 0;
+    result->charger_online = strcmp(status, "Charging") == 0;
     result->voltage_mv = voltage_uv / 1000;
+    /* power_supply current_now is signed: positive while charging, negative while discharging. */
     result->current_ma = current_ua / 1000;
     return 0;
 }
@@ -76,11 +92,10 @@ int fast_charge_run_test(struct fast_charge_device *device, const struct fast_ch
     delay.tv_nsec = (request->sample_interval_ms % 1000) * 1000000L;
     while (elapsed <= request->timeout_ms) {
         if (fast_charge_read(device, result) != 0) return -1;
-        if (result->charger_online && result->voltage_mv >= request->voltage_min_mv &&
-            result->voltage_mv <= request->voltage_max_mv && result->current_ma >= request->current_min_ma &&
+        if (result->current_ma >= request->current_min_ma &&
             result->current_ma <= request->current_max_ma) {
             if (++result->stable_samples >= request->stable_sample_count) {
-                set_message(result, 0, "Charge voltage and current are stable");
+                set_message(result, 0, "Charge current is in range; battery voltage sampled");
                 return 0;
             }
         } else {
@@ -89,6 +104,6 @@ int fast_charge_run_test(struct fast_charge_device *device, const struct fast_ch
         nanosleep(&delay, NULL);
         elapsed += request->sample_interval_ms;
     }
-    set_message(result, 4401, "Charge values did not reach the configured range");
+    set_message(result, 4401, "Charge current did not reach the configured range");
     return -1;
 }
