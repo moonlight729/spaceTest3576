@@ -9,6 +9,7 @@
 #include "../hardware/ethernet/ethernet_nmcli.h"
 #include "../hardware/bluetooth/bluetoothctl_scan.h"
 #include "../hardware/pressure/pressure_peripheral.h"
+#include "../hardware/lcd_test.h"
 #include "../hardware/camera/camera_stream.h"
 
 #include <stdio.h>
@@ -28,6 +29,18 @@ static int pressure_load_error_count = 0;
 
 static int send_failure(int fd, const char *session_id, int code, const char *message);
 static int send_ok_response(int fd, const char *session_id, const char *message);
+
+static int start_lcd_display(int fd, const struct protocol_request *request)
+{
+    pid_t pid = fork();
+    if (pid < 0) return send_failure(fd, request->session_id, 2201, "Unable to fork LCD display process");
+    if (pid == 0) {
+        setsid();
+        execl("/userdata/work/spaceTest3576/spilcd_test", "spilcd_test", (char *)NULL);
+        _exit(127);
+    }
+    return send_ok_response(fd, request->session_id, "LCD test display started");
+}
 
 static int control_gen1_app_service(const char *action)
 {
@@ -456,11 +469,16 @@ int session_manager_handle_client(int client_fd, const struct app_config *config
     if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "enter_test_mode") == 0) {
         return send_ok_response(client_fd, request.session_id, "Test mode entered");
     }
+    if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "start_lcd_display") == 0) {
+        return start_lcd_display(client_fd, &request);
+    }
     if (strcmp(request.command_group, "sys") == 0 && strcmp(request.command, "sync_session_summary") == 0) {
         return handle_sync_session_summary(client_fd, &request, line, config);
     }
-    if (strcmp(request.command_group, "session") == 0 && strcmp(request.command, "start") == 0)
+    if (strcmp(request.command_group, "session") == 0 && strcmp(request.command, "start") == 0) {
+        lcd_test_start("/dev/fb0");
         return test_runner_run_plan(client_fd, request.session_id, line, config);
+    }
     if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "start") == 0)
         return handle_pressure_start(client_fd, &request);
     if (strcmp(request.command_group, "pressure") == 0 && strcmp(request.command, "cpu") == 0)

@@ -7,6 +7,7 @@ APP_OBJECTS = \
 	storage/board_state.o \
 	hardware/fingerprint/fingerprint.o \
 	hardware/indicator_led/indicator_led.o \
+	hardware/lcd_test.o \
 	hardware/bluetooth/bluetoothctl_scan.o \
 	hardware/camera/camera_stream.o \
 	hardware/ethernet/ethernet_nmcli.o \
@@ -38,6 +39,8 @@ hardware/fingerprint/fingerprint.o: hardware/fingerprint/fingerprint.c hardware/
 	$(CC) $(CFLAGS) -c hardware/fingerprint/fingerprint.c -o $@
 hardware/indicator_led/indicator_led.o: hardware/indicator_led/indicator_led.c hardware/indicator_led/indicator_led.h
 	$(CC) $(CFLAGS) -c hardware/indicator_led/indicator_led.c -o $@
+hardware/lcd_test.o: hardware/lcd_test.c hardware/lcd_test.h
+	$(CC) $(CFLAGS) -c hardware/lcd_test.c -o $@
 hardware/bluetooth/bluetoothctl_scan.o: hardware/bluetooth/bluetoothctl_scan.c hardware/bluetooth/bluetoothctl_scan.h
 	$(CC) $(CFLAGS) -c hardware/bluetooth/bluetoothctl_scan.c -o $@
 hardware/camera/camera_stream.o: hardware/camera/camera_stream.c hardware/camera/camera_stream.h
@@ -64,7 +67,7 @@ hardware/pressure/pressure_peripheral.o: hardware/pressure/pressure_peripheral.c
 	$(CC) $(CFLAGS) -c hardware/pressure/pressure_peripheral.c -o $@
 tests/test_runner.o: tests/test_runner.c tests/test_runner.h protocol/protocol.h storage/board_state.h hardware/fingerprint/fingerprint.h hardware/indicator_led/indicator_led.h hardware/bluetooth/bluetoothctl_scan.h hardware/camera/camera_stream.h hardware/ethernet/ethernet_nmcli.h hardware/fast_charge/fast_charge.h hardware/keys/key_input.h hardware/wifi/wifi_nmcli.h hardware/tf_card/tf_card.h hardware/usb3.0/usb3_file_check.h hardware/usb/usb_insert_test.h hardware/pcba_points/pcba_points.h
 	$(CC) $(CFLAGS) -c tests/test_runner.c -o $@
-manage/session_manager.o: manage/session_manager.c manage/session_manager.h protocol/protocol.h storage/board_state.h tests/test_runner.h hardware/pressure/pressure_stress.h hardware/pressure/pressure_peripheral.h
+manage/session_manager.o: manage/session_manager.c manage/session_manager.h protocol/protocol.h storage/board_state.h tests/test_runner.h hardware/pressure/pressure_stress.h hardware/pressure/pressure_peripheral.h hardware/lcd_test.h
 	$(CC) $(CFLAGS) -c manage/session_manager.c -o $@
 main.o: main.c config/app_config.h manage/session_manager.h
 	$(CC) $(CFLAGS) -c main.c -o $@
