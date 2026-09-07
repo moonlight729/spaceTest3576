@@ -329,6 +329,8 @@ static int send_versions(int fd, const struct protocol_request *r)
     char uboot[128] = "unknown";
     char kernel[128] = "unknown";
     char rootfs[64] = "unknown";
+    char gen1_app[128] = "unknown";
+    int gen1_app_installed = 0;
     char line[256];
 
     FILE *pipe = popen("version 2>/dev/null", "r");
@@ -343,26 +345,42 @@ static int send_versions(int fd, const struct protocol_request *r)
             while (*value == ' ' || *value == '\t') {
                 value++;
             }
+            value[strcspn(value, "\r\n")] = '\0';
 
             if (strstr(line, "uboot") != NULL) {
                 snprintf(uboot, sizeof(uboot), "%s", value);
             } else if (strstr(line, "kernel") != NULL) {
                 snprintf(kernel, sizeof(kernel), "%s", value);
+            } else if (strstr(line, "rootfs") != NULL) {
+                snprintf(rootfs, sizeof(rootfs), "%s", value);
             }
         }
 
         pclose(pipe);
     }
 
-    char data[512];
+    pipe = popen("dpkg-query -W -f='${db:Status-Abbrev} ${Version}\\n' gen1-app 2>/dev/null", "r");
+    if (pipe != NULL && fgets(line, sizeof(line), pipe) != NULL) {
+        char status[8];
+        char package_version[128];
+        if (sscanf(line, "%7s %127s", status, package_version) == 2) {
+            snprintf(gen1_app, sizeof(gen1_app), "%s", package_version);
+            gen1_app_installed = strcmp(status, "ii") == 0;
+        }
+    }
+    if (pipe != NULL) pclose(pipe);
+
+    char data[768];
     snprintf(
         data,
         sizeof(data),
         "{\"ubootVersion\":\"%s\",\"kernelVersion\":\"%s\","
-        "\"rootfsVersion\":\"%s\"}",
+        "\"rootfsVersion\":\"%s\",\"gen1AppVersion\":\"%s\",\"gen1AppInstalled\":%s}",
         uboot,
         kernel,
-        rootfs);
+        rootfs,
+        gen1_app,
+        gen1_app_installed ? "true" : "false");
 
     char response[768];
     protocol_build_response_envelope(
