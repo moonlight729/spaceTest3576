@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/select.h>
@@ -1777,6 +1778,44 @@ static int write_fan_pwm(const char *path, int value)
     return 0;
 }
 
+static int resolve_fan_hwmon(const char *root, char *hwmon_path, size_t hwmon_path_size,
+                             char *pwm_path, size_t pwm_path_size,
+                             char *tach_path, size_t tach_path_size)
+{
+    DIR *directory;
+    struct dirent *entry;
+    struct stat entry_stat;
+    char candidate[256];
+    int match_count = 0;
+
+    if (root == NULL || root[0] == '\0') return -1;
+    directory = opendir(root);
+    if (directory == NULL) return -1;
+
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", root, entry->d_name) >= (int)sizeof(candidate)) {
+            closedir(directory);
+            return -1;
+        }
+        if (stat(candidate, &entry_stat) != 0 || !S_ISDIR(entry_stat.st_mode)) continue;
+        ++match_count;
+        if (match_count == 1 &&
+            snprintf(hwmon_path, hwmon_path_size, "%s", candidate) >= (int)hwmon_path_size) {
+            closedir(directory);
+            return -1;
+        }
+    }
+    closedir(directory);
+    if (match_count != 1) return -1;
+
+    if (snprintf(pwm_path, pwm_path_size, "%s/pwm1", hwmon_path) >= (int)pwm_path_size ||
+        snprintf(tach_path, tach_path_size, "%s/tach_rpm", hwmon_path) >= (int)tach_path_size) {
+        return -1;
+    }
+    return 0;
+}
+
 static int read_fan_tach(const char *path, int *value)
 {
     FILE *file = fopen(path, "r");
@@ -1813,8 +1852,10 @@ static int read_fan_tach_stable(const char *path, int sample_count, int interval
 
 static int run_finished_product_fan(int fd, const char *test_start, const char *test_end)
 {
-    char pwm_path[192] = "/sys/class/hwmon/hwmon12/pwm1";
-    char tach_path[192] = "/sys/class/hwmon/hwmon12/tach_rpm";
+    char hwmon_root[192] = "/sys/bus/platform/drivers/pwm-fan/fan1/hwmon";
+    char hwmon_path[256];
+    char pwm_path[256];
+    char tach_path[256];
     char data[1024];
     int start_value = param_int(test_start, test_end, "startValue", 255);
     int stop_value = param_int(test_start, test_end, "stopValue", 0);
@@ -1825,16 +1866,23 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     int tach_running_seen = 0;
     int tach_samples_read = 0;
 
-    param_string(test_start, test_end, "pwmPath", pwm_path, sizeof(pwm_path));
-    param_string(test_start, test_end, "tachPath", tach_path, sizeof(tach_path));
+    param_string(test_start, test_end, "hwmonRoot", hwmon_root, sizeof(hwmon_root));
     if (settle_ms < 0) settle_ms = 0;
+    if (resolve_fan_hwmon(hwmon_root, hwmon_path, sizeof(hwmon_path),
+                          pwm_path, sizeof(pwm_path), tach_path, sizeof(tach_path)) != 0) {
+        snprintf(data, sizeof(data), "{\"automatic\":true,\"hwmonRoot\":\"%s\"}", hwmon_root);
+        send_report(fd, "fan", "failed", 3923, "Unable to resolve unique fan hwmon directory", data);
+        return -1;
+    }
     if (write_fan_pwm(pwm_path, start_value) != 0) {
-        send_report(fd, "fan", "failed", 3920, "Unable to start fan PWM", "{}");
+        snprintf(data, sizeof(data), "{\"automatic\":true,\"hwmonPath\":\"%s\",\"pwmPath\":\"%s\"}",
+                 hwmon_path, pwm_path);
+        send_report(fd, "fan", "failed", 3920, "Unable to start fan PWM", data);
         return -1;
     }
     snprintf(data, sizeof(data),
-             "{\"automatic\":true,\"pwmPath\":\"%s\",\"tachPath\":\"%s\",\"startValue\":%d,\"stopValue\":%d,\"tachSettleMs\":%d}",
-             pwm_path, tach_path, start_value, stop_value, settle_ms);
+             "{\"automatic\":true,\"hwmonPath\":\"%s\",\"pwmPath\":\"%s\",\"tachPath\":\"%s\",\"startValue\":%d,\"stopValue\":%d,\"tachSettleMs\":%d}",
+             hwmon_path, pwm_path, tach_path, start_value, stop_value, settle_ms);
     send_report(fd, "fan", "running", 0, "Fan started; checking tach_rpm automatically", data);
     if (settle_ms > 0) {
         struct timespec settle_time = {
@@ -1846,7 +1894,8 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     if (read_fan_tach_stable(tach_path, tach_sample_count, tach_sample_interval_ms,
                              &tach_value, &tach_running_seen, &tach_samples_read) != 0) {
         write_fan_pwm(pwm_path, stop_value);
-        snprintf(data, sizeof(data), "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRead\":false}", tach_path);
+        snprintf(data, sizeof(data), "{\"automatic\":true,\"hwmonPath\":\"%s\",\"tachPath\":\"%s\",\"tachRead\":false}",
+                 hwmon_path, tach_path);
         send_report(fd, "fan", "failed", 3922, "Unable to read fan tach_rpm", data);
         return -1;
     }
@@ -1856,9 +1905,9 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
         return -1;
     }
     snprintf(data, sizeof(data),
-             "{\"automatic\":true,\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,"
+             "{\"automatic\":true,\"hwmonPath\":\"%s\",\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,"
              "\"tachSampleCount\":%d,\"tachSamplesRead\":%d,\"tachSampleIntervalMs\":%d,\"pwmStopped\":true}",
-             tach_path, tach_value, tach_running_seen ? "true" : "false",
+             hwmon_path, tach_path, tach_value, tach_running_seen ? "true" : "false",
              tach_sample_count, tach_samples_read, tach_sample_interval_ms);
     return send_report(fd, "fan", tach_running_seen ? "passed" : "failed", tach_running_seen ? 0 : 3910,
                        tach_running_seen ? "Fan tach_rpm indicates running" : "Fan tach_rpm indicates stopped", data) == 0 && tach_running_seen ? 0 : -1;
