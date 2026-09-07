@@ -2632,6 +2632,32 @@ static int send_completed(int fd, const char *session_id, const char *status,
     return protocol_write_line(fd, line);
 }
 
+#define TEST_COMPLETION_FLAG_PATH "/oem/config/wlan0_bt_switch"
+
+static int set_test_completion_flag(int expected_value)
+{
+    FILE *file;
+    int actual_value;
+
+    file = fopen(TEST_COMPLETION_FLAG_PATH, "w");
+    if (file == NULL) return -1;
+    if (fprintf(file, "%d\n", expected_value) < 0 ||
+        fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) return -1;
+
+    file = fopen(TEST_COMPLETION_FLAG_PATH, "r");
+    if (file == NULL) return -1;
+    if (fscanf(file, "%d", &actual_value) != 1) {
+        fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) return -1;
+    return actual_value == expected_value ? 0 : -1;
+}
+
 static void remember_failure(int *failed_count, int *first_failed_code,
                              char *first_failed_test, size_t first_failed_test_size,
                              int code, const char *test_id)
@@ -2746,6 +2772,12 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
     int rc;
 
     format_timestamp_now(session_start_time, sizeof(session_start_time));
+    if (set_test_completion_flag(1) != 0) {
+        send_report(fd, "completion_flag", "failed", 3020,
+                    "Unable to reset test completion flag", "{}");
+        return send_completed(fd, session_id, "failed", 3020,
+                              "Unable to reset test completion flag");
+    }
 
     while (read_next_test(&cursor, test_id, sizeof(test_id), &test_start, &test_end)) {
         executed++;
@@ -2776,7 +2808,13 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
             send_report(fd, "unknown", "failed", 3000, "No supported test id found", "{}");
             return send_completed(fd, session_id, "failed", 3000, "No supported test id found");
         }
-        run_board_state(fd);
+        executed = 1;
+        rc = run_board_state(fd);
+        if (rc != 0) {
+            remember_failure(&failed_count, &first_failed_code,
+                             first_failed_test, sizeof(first_failed_test),
+                             failure_code_for_test("board_state"), "board_state");
+        }
     }
 
     if (failed_count > 0) {
@@ -2791,12 +2829,22 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
     }
     if (skipped_count > 0) {
         char message[160];
-        snprintf(message, sizeof(message), "Session completed with %d skipped test(s)", skipped_count);
+        snprintf(message, sizeof(message), "Session incomplete with %d skipped test(s)", skipped_count);
         if (config != NULL) {
             board_state_record_session_result(config->board_state_path, session_id,
-                                              session_start_time, session_end_time, "Pass");
+                                              session_start_time, session_end_time, "Fail");
         }
-        return send_completed(fd, session_id, "passed", 0, message);
+        return send_completed(fd, session_id, "failed", 3022, message);
+    }
+    if (set_test_completion_flag(0) != 0) {
+        if (config != NULL) {
+            board_state_record_session_result(config->board_state_path, session_id,
+                                              session_start_time, session_end_time, "Fail");
+        }
+        send_report(fd, "completion_flag", "failed", 3021,
+                    "Unable to persist test completion flag", "{}");
+        return send_completed(fd, session_id, "failed", 3021,
+                              "Unable to persist test completion flag");
     }
     if (config != NULL) {
         board_state_record_session_result(config->board_state_path, session_id,
