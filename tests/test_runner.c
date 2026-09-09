@@ -2758,6 +2758,9 @@ static int failure_code_for_test(const char *test_id)
 int test_runner_run_plan(int fd, const char *session_id, const char *request_json,
                          const struct app_config *config)
 {
+    /* Only finished-product runs use the system completion flag. */
+    int completion_flag_enabled = request_json != NULL &&
+                                  strstr(request_json, "\"mode\":\"finished_product\"") != NULL;
     int executed = 0;
     int failed_count = 0;
     int skipped_count = 0;
@@ -2772,7 +2775,7 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
     int rc;
 
     format_timestamp_now(session_start_time, sizeof(session_start_time));
-    if (set_test_completion_flag(1) != 0) {
+    if (completion_flag_enabled && set_test_completion_flag(1) != 0) {
         send_report(fd, "completion_flag", "failed", 3020,
                     "Unable to reset test completion flag", "{}");
         return send_completed(fd, session_id, "failed", 3020,
@@ -2836,7 +2839,7 @@ int test_runner_run_plan(int fd, const char *session_id, const char *request_jso
         }
         return send_completed(fd, session_id, "failed", 3022, message);
     }
-    if (set_test_completion_flag(0) != 0) {
+    if (completion_flag_enabled && set_test_completion_flag(0) != 0) {
         if (config != NULL) {
             board_state_record_session_result(config->board_state_path, session_id,
                                               session_start_time, session_end_time, "Fail");
