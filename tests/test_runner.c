@@ -1826,7 +1826,7 @@ static int read_fan_tach(const char *path, int *value)
     return scanned == 1 ? 0 : -1;
 }
 
-static int read_fan_tach_stable(const char *path, int sample_count, int interval_ms,
+static int read_fan_tach_stable(const char *path, int sample_count, int interval_ms, int min_rpm,
                                 int *last_value, int *running_seen, int *samples_read)
 {
     int index;
@@ -1837,11 +1837,12 @@ static int read_fan_tach_stable(const char *path, int sample_count, int interval
     *samples_read = 0;
     if (sample_count <= 0) sample_count = 1;
     if (interval_ms < 0) interval_ms = 0;
+    if (min_rpm < 0) min_rpm = 0;
     for (index = 0; index < sample_count; ++index) {
         if (read_fan_tach(path, &value) != 0) return -1;
         *last_value = value;
         *samples_read = index + 1;
-        if (value == 1) {
+        if (value > min_rpm) {
             *running_seen = 1;
             return 0;
         }
@@ -1862,12 +1863,14 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     int settle_ms = param_int(test_start, test_end, "tachSettleMs", 1000);
     int tach_sample_count = param_int(test_start, test_end, "tachSampleCount", 3);
     int tach_sample_interval_ms = param_int(test_start, test_end, "tachSampleIntervalMs", 300);
+    int min_rpm = param_int(test_start, test_end, "minRpm", 400);
     int tach_value = 0;
     int tach_running_seen = 0;
     int tach_samples_read = 0;
 
     param_string(test_start, test_end, "hwmonRoot", hwmon_root, sizeof(hwmon_root));
     if (settle_ms < 0) settle_ms = 0;
+    if (min_rpm < 0) min_rpm = 0;
     if (resolve_fan_hwmon(hwmon_root, hwmon_path, sizeof(hwmon_path),
                           pwm_path, sizeof(pwm_path), tach_path, sizeof(tach_path)) != 0) {
         snprintf(data, sizeof(data), "{\"automatic\":true,\"hwmonRoot\":\"%s\"}", hwmon_root);
@@ -1881,8 +1884,8 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
         return -1;
     }
     snprintf(data, sizeof(data),
-             "{\"automatic\":true,\"hwmonPath\":\"%s\",\"pwmPath\":\"%s\",\"tachPath\":\"%s\",\"startValue\":%d,\"stopValue\":%d,\"tachSettleMs\":%d}",
-             hwmon_path, pwm_path, tach_path, start_value, stop_value, settle_ms);
+             "{\"automatic\":true,\"hwmonPath\":\"%s\",\"pwmPath\":\"%s\",\"tachPath\":\"%s\",\"startValue\":%d,\"stopValue\":%d,\"tachSettleMs\":%d,\"minRpm\":%d}",
+             hwmon_path, pwm_path, tach_path, start_value, stop_value, settle_ms, min_rpm);
     send_report(fd, "fan", "running", 0, "Fan started; checking tach_rpm automatically", data);
     if (settle_ms > 0) {
         struct timespec settle_time = {
@@ -1891,7 +1894,7 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
         };
         nanosleep(&settle_time, NULL);
     }
-    if (read_fan_tach_stable(tach_path, tach_sample_count, tach_sample_interval_ms,
+    if (read_fan_tach_stable(tach_path, tach_sample_count, tach_sample_interval_ms, min_rpm,
                              &tach_value, &tach_running_seen, &tach_samples_read) != 0) {
         write_fan_pwm(pwm_path, stop_value);
         snprintf(data, sizeof(data), "{\"automatic\":true,\"hwmonPath\":\"%s\",\"tachPath\":\"%s\",\"tachRead\":false}",
@@ -1906,9 +1909,9 @@ static int run_finished_product_fan(int fd, const char *test_start, const char *
     }
     snprintf(data, sizeof(data),
              "{\"automatic\":true,\"hwmonPath\":\"%s\",\"tachPath\":\"%s\",\"tachRpm\":%d,\"fanRunning\":%s,"
-             "\"tachSampleCount\":%d,\"tachSamplesRead\":%d,\"tachSampleIntervalMs\":%d,\"pwmStopped\":true}",
+             "\"tachSampleCount\":%d,\"tachSamplesRead\":%d,\"tachSampleIntervalMs\":%d,\"minRpm\":%d,\"pwmStopped\":true}",
              hwmon_path, tach_path, tach_value, tach_running_seen ? "true" : "false",
-             tach_sample_count, tach_samples_read, tach_sample_interval_ms);
+             tach_sample_count, tach_samples_read, tach_sample_interval_ms, min_rpm);
     return send_report(fd, "fan", tach_running_seen ? "passed" : "failed", tach_running_seen ? 0 : 3910,
                        tach_running_seen ? "Fan tach_rpm indicates running" : "Fan tach_rpm indicates stopped", data) == 0 && tach_running_seen ? 0 : -1;
 }
