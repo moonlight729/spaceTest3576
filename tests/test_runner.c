@@ -741,12 +741,48 @@ static void __attribute__((unused)) append_pcba_points_json(char *data, size_t d
     snprintf(data + used, data_size - used, "]}");
 }
 
+static int pcba_point_channel_name(int channel, char *name, size_t name_size)
+{
+    static const char *const names[32] = {
+        "VBUSIN_VCC", "ZERO_V_02", "VCC_3V3_S3", "VCC5V0_SYS",
+        "VBUS5V0_TYPEC", "VCC-RTC", "VDD_NPU_S0", "VCC_SYS",
+        "VDD2H_DDR_S3", "VDD_GPU_S0", "VDD_LOGIC_S0", "VDD_CPU_LIT_S0",
+        "VBUS5V0_TYPEC", "VDD_CPU_BIG_S0", "VCC_2V0_PLDO_S3", "VCC_1V8_S3",
+        "GND", "ZERO_V_18", "VBUS1_TYPEC", "ZERO_V_20",
+        "TXD", "RXD", "ZERO_V_23", "VBAT_TS",
+        "VDD_DDR_S0", "VDDQ_DDR_S0", "ZERO_V_27", "ZERO_V_28",
+        "CH29", "CH30", "CH31", "CH32"
+    };
+    if (channel < 1 || channel > 32 || name == NULL || name_size == 0) return -1;
+    snprintf(name, name_size, "%s", names[channel - 1]);
+    return 0;
+}
+
 static int run_pcba_test_points(int fd, const char *test_start, const char *test_end)
 {
     int timeout_ms = param_int(test_start, test_end, "timeoutMs", 30000);
     int passed = 0;
-    char data[512];
-    snprintf(data, sizeof(data), "{\"channelCount\":32,\"readyForHostDecision\":true}");
+    /* Include the configured channel labels in the host measurement request. */
+    char data[2048];
+    size_t used = (size_t)snprintf(data, sizeof(data),
+                                   "{\"channelCount\":32,\"readyForHostDecision\":true,"
+                                   "\"channels\":[");
+    {
+        int ci;
+        for (ci = 1; ci <= 32 && used + 64 < sizeof(data); ++ci) {
+            char name[40];
+            const char *sep = (ci == 1) ? "" : ",";
+            if (pcba_point_channel_name(ci, name, sizeof(name)) != 0) {
+                snprintf(name, sizeof(name), "CH%d", ci);
+            }
+            used += (size_t)snprintf(data + used, sizeof(data) - used,
+                                     "%s{\"index\":%d,\"name\":\"%s\"}",
+                                     sep, ci, name);
+        }
+        if (used + 2 < sizeof(data)) {
+            snprintf(data + used, sizeof(data) - used, "]}");
+        }
+    }
     send_report(fd, "pcba_test_points", "running", 0,
                 "Waiting for host JX-TVM voltage measurement", data);
     switch (wait_test_decision(fd, "pcba_test_points", timeout_ms, &passed)) {
@@ -2404,25 +2440,151 @@ static int run_finished_product_indicator_led(int fd, const char *test_start, co
 #undef INDICATOR_LED_PHASE_COUNT
 }
 
-static int run_recovery_adc(int fd, const char *test_start, const char *test_end)
+/*
+ * PCBA-only visual check. It deliberately controls only the RED and BLUE
+ * sysfs LEDs and never reads charger state or calls indicator_led_set_charge().
+ */
+static int run_pcba_indicator_led(int fd, const char *test_start, const char *test_end)
 {
-    const char *adc_path = "/sys/devices/platform/2ae00000.adc/iio:device0/in_voltage1_raw";
-    int threshold = param_int(test_start, test_end, "recoveryPressThreshold", 100);
-    int max_raw = param_int(test_start, test_end, "recoveryMaxRaw", 5000);
-    int stable_required = param_int(test_start, test_end, "recoveryStableSampleCount", 3);
-    int sample_interval_ms = param_int(test_start, test_end, "recoverySampleIntervalMs", 100);
-    int timeout_ms = param_int(test_start, test_end, "recoveryTimeoutMs", 10000);
+#define PCBA_LED_ON_BRIGHTNESS 255
+    struct indicator_led_device device;
+    struct indicator_led_result result;
+    int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 2000);
+    int cycle_count = param_int(test_start, test_end, "cycleCount", 2);
+    int decision_timeout_ms = param_int(test_start, test_end, "manualDecisionTimeoutMs", 30000);
+    int passed = 0;
+    int cycle;
+    int phase;
+    char data[512];
+
+    if (phase_ms <= 0) phase_ms = 2000;
+    if (cycle_count <= 0) cycle_count = 2;
+    if (cycle_count > 10) cycle_count = 10;
+    if (decision_timeout_ms <= 0) decision_timeout_ms = 30000;
+
+    if (indicator_led_open(&device) != 0) {
+        send_report(fd, "pcba_indicator_led", "failed", 4610,
+                    "Unable to open PCBA indicator LED controls", "{}");
+        return -1;
+    }
+
+    if (indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result) != 0 ||
+        indicator_led_set(&device, INDICATOR_LED_RED, 0, &result) != 0) {
+        indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+        indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+        indicator_led_close(&device);
+        send_report(fd, "pcba_indicator_led", "failed", 4611,
+                    "Unable to initialize PCBA red/blue LEDs", "{}");
+        return -1;
+    }
+
+    for (cycle = 1; cycle <= cycle_count; ++cycle) {
+        for (phase = 0; phase < 2; ++phase) {
+            const char *current_led = phase == 0 ? "red" : "blue";
+            int drive_ok;
+
+            if (phase == 0) {
+                drive_ok = indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result) == 0 &&
+                           indicator_led_set(&device, INDICATOR_LED_RED, PCBA_LED_ON_BRIGHTNESS, &result) == 0;
+            } else {
+                drive_ok = indicator_led_set(&device, INDICATOR_LED_RED, 0, &result) == 0 &&
+                           indicator_led_set(&device, INDICATOR_LED_BLUE, PCBA_LED_ON_BRIGHTNESS, &result) == 0;
+            }
+            if (!drive_ok) {
+                indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+                indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+                indicator_led_close(&device);
+                snprintf(data, sizeof(data),
+                         "{\"phase\":\"show_color\",\"currentLed\":\"%s\","
+                         "\"cycleIndex\":%d,\"cycleCount\":%d}",
+                         current_led, cycle, cycle_count);
+                send_report(fd, "pcba_indicator_led", "failed", 4611,
+                            "Unable to switch PCBA red/blue LED", data);
+                return -1;
+            }
+
+            snprintf(data, sizeof(data),
+                     "{\"phase\":\"show_color\",\"displayMode\":\"red_blue_alternating\","
+                     "\"currentLed\":\"%s\",\"phaseIndex\":%d,\"phaseCount\":2,"
+                     "\"cycleIndex\":%d,\"cycleCount\":%d,\"phaseDurationMs\":%d,"
+                     "\"requiresOperatorDecision\":true}",
+                     current_led, phase + 1, cycle, cycle_count, phase_ms);
+            if (send_report(fd, "pcba_indicator_led", "running", 0,
+                            phase == 0 ? "PCBA red LED is on" : "PCBA blue LED is on",
+                            data) != 0) {
+                indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+                indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+                indicator_led_close(&device);
+                return -2;
+            }
+            sleep_ms_local(phase_ms);
+        }
+    }
+
+    indicator_led_set(&device, INDICATOR_LED_BLUE, 0, &result);
+    indicator_led_set(&device, INDICATOR_LED_RED, 0, &result);
+    snprintf(data, sizeof(data),
+             "{\"phase\":\"awaiting_operator\",\"displayMode\":\"red_blue_alternating\","
+             "\"manualObserved\":true,\"requiresOperatorDecision\":true,"
+             "\"cycleCount\":%d,\"manualDecisionTimeoutMs\":%d}",
+             cycle_count, decision_timeout_ms);
+    if (send_report(fd, "pcba_indicator_led", "running", 0,
+                    "Confirm the PCBA red/blue LED sequence", data) != 0) {
+        indicator_led_close(&device);
+        return -2;
+    }
+
+    switch (wait_operator_decision(fd, "pcba_indicator_led", decision_timeout_ms, &passed)) {
+    case 1:
+        indicator_led_close(&device);
+        snprintf(data, sizeof(data),
+                 "{\"manualObserved\":true,\"operatorConfirmed\":%s,"
+                 "\"displayMode\":\"red_blue_alternating\",\"cycleCount\":%d}",
+                 passed ? "true" : "false", cycle_count);
+        send_report(fd, "pcba_indicator_led", passed ? "passed" : "failed",
+                    passed ? 0 : 4614,
+                    passed ? "Operator confirmed PCBA red/blue LEDs pass" :
+                             "Operator confirmed PCBA red/blue LEDs fail",
+                    data);
+        return passed ? 0 : -1;
+    case 0:
+        indicator_led_close(&device);
+        send_report(fd, "pcba_indicator_led", "failed", 4612,
+                    "PCBA indicator LED operator decision timed out", "{}");
+        return -1;
+    default:
+        indicator_led_close(&device);
+        return -2;
+    }
+#undef PCBA_LED_ON_BRIGHTNESS
+}
+
+static int run_adc_key(int fd, const char *test_start, const char *test_end,
+                       const char *phase, const char *display_name,
+                       const char *default_path, const char *path_parameter,
+                       const char *threshold_parameter, const char *max_parameter,
+                       const char *stable_parameter, const char *interval_parameter,
+                       const char *timeout_parameter, int failure_code, int final_key)
+{
+    char adc_path[256];
+    int threshold = param_int(test_start, test_end, threshold_parameter, 100);
+    int max_raw = param_int(test_start, test_end, max_parameter, 5000);
+    int stable_required = param_int(test_start, test_end, stable_parameter, 3);
+    int sample_interval_ms = param_int(test_start, test_end, interval_parameter, 100);
+    int timeout_ms = param_int(test_start, test_end, timeout_parameter, 10000);
     int stable_count = 0;
     int elapsed_ms = 0;
     char data[512];
 
+    snprintf(adc_path, sizeof(adc_path), "%s", default_path);
+    param_string(test_start, test_end, path_parameter, adc_path, sizeof(adc_path));
     if (stable_required <= 0) stable_required = 3;
     if (sample_interval_ms <= 0) sample_interval_ms = 100;
     if (timeout_ms <= 0) timeout_ms = 10000;
     snprintf(data, sizeof(data),
-             "{\"phase\":\"recovery\",\"adcPath\":\"%s\",\"rawValue\":-1,\"pressThreshold\":%d,\"maxRaw\":%d,\"stableCount\":0,\"stableRequired\":%d,\"timeoutMs\":%d}",
-             adc_path, threshold, max_raw, stable_required, timeout_ms);
-    send_report(fd, "keys", "running", 0, "Please press Recovery key", data);
+             "{\"phase\":\"%s\",\"adcPath\":\"%s\",\"rawValue\":-1,\"pressThreshold\":%d,\"maxRaw\":%d,\"stableCount\":0,\"stableRequired\":%d,\"timeoutMs\":%d}",
+             phase, adc_path, threshold, max_raw, stable_required, timeout_ms);
+    send_report(fd, "keys", "running", 0, display_name, data);
 
     while (elapsed_ms <= timeout_ms) {
         FILE *file = fopen(adc_path, "r");
@@ -2435,18 +2597,38 @@ static int run_recovery_adc(int fd, const char *test_start, const char *test_end
         if (raw_value >= 0 && raw_value <= max_raw && raw_value < threshold) stable_count++;
         else stable_count = 0;
         snprintf(data, sizeof(data),
-                 "{\"phase\":\"recovery\",\"adcPath\":\"%s\",\"rawValue\":%d,\"pressThreshold\":%d,\"maxRaw\":%d,\"stableCount\":%d,\"stableRequired\":%d,\"elapsedMs\":%d,\"timeoutMs\":%d}",
-                 adc_path, raw_value, threshold, max_raw, stable_count, stable_required, elapsed_ms, timeout_ms);
+                 "{\"phase\":\"%s\",\"adcPath\":\"%s\",\"rawValue\":%d,\"pressThreshold\":%d,\"maxRaw\":%d,\"stableCount\":%d,\"stableRequired\":%d,\"elapsedMs\":%d,\"timeoutMs\":%d%s}",
+                 phase, adc_path, raw_value, threshold, max_raw, stable_count, stable_required, elapsed_ms, timeout_ms,
+                 stable_count >= stable_required ? ",\"adcDetected\":true" : "");
         if (stable_count >= stable_required) {
-            return send_report(fd, "keys", "passed", 0, "Recovery key detected", data);
+            return send_report(fd, "keys", final_key ? "passed" : "running", 0,
+                               final_key ? "ADC key detected" : "ADC key detected; continuing", data);
         }
-        send_report(fd, "keys", "running", 0, "Waiting for Recovery key ADC threshold", data);
+        send_report(fd, "keys", "running", 0, "Waiting for ADC key threshold", data);
         sleep_ms_local(sample_interval_ms);
         elapsed_ms += sample_interval_ms;
     }
 
-    send_report(fd, "keys", "failed", 4003, "Recovery key was not detected", data);
+    send_report(fd, "keys", "failed", failure_code, "ADC key was not detected", data);
     return -1;
+}
+
+static int run_recovery_adc(int fd, const char *test_start, const char *test_end)
+{
+    return run_adc_key(fd, test_start, test_end, "recovery", "Please press Recovery key",
+                       "/sys/devices/platform/2ae00000.adc/iio:device0/in_voltage1_raw",
+                       "recoveryAdcPath", "recoveryPressThreshold", "recoveryMaxRaw",
+                       "recoveryStableSampleCount", "recoverySampleIntervalMs",
+                       "recoveryTimeoutMs", 4003, 1);
+}
+
+static int run_maskrom_adc(int fd, const char *test_start, const char *test_end)
+{
+    return run_adc_key(fd, test_start, test_end, "maskrom", "Please press MASKROM key",
+                       "/sys/devices/platform/2ae00000.adc/iio:device0/in_voltage0_raw",
+                       "maskromAdcPath", "maskromPressThreshold", "maskromMaxRaw",
+                       "maskromStableSampleCount", "maskromSampleIntervalMs",
+                       "maskromTimeoutMs", 4004, 0);
 }
 
 static int run_keys(int fd, const struct app_config *config, const char *test_start, const char *test_end)
@@ -2468,7 +2650,7 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
     send_report(fd, "keys", "running", 0,
                 strcmp(test_mode, "finished_product") == 0
                     ? "Press Up, Down, Left, Right, Confirm, then Recovery key"
-                    : "Press Up, Down, Left, Right, Confirm",
+                    : "Press Up, Down, Left, Right, Confirm, then MASKROM and Recovery keys",
                 data);
     if (key_input_open(&input) != 0) {
         send_report(fd, "keys", "failed", 4000, "Unable to open key input devices", "{}");
@@ -2512,7 +2694,8 @@ static int run_keys(int fd, const struct app_config *config, const char *test_st
     if (strcmp(test_mode, "finished_product") == 0) {
         return run_recovery_adc(fd, test_start, test_end);
     }
-    return send_report(fd, "keys", "passed", 0, "Five-key test passed", data);
+    if (run_maskrom_adc(fd, test_start, test_end) != 0) return -1;
+    return run_recovery_adc(fd, test_start, test_end);
 }
 
 static int ensure_gen1_service_stopped(void) { int rc = system("systemctl cat gen1-app.service"); if (rc != 0) return 0; if (system("systemctl stop gen1-app.service") != 0) return -1; rc = system("systemctl is-active --quiet gen1-app.service"); return rc == 0 ? -1 : 0; }
@@ -2715,6 +2898,9 @@ static int run_one_test(int fd, const char *test_id, const struct app_config *co
     if (strcmp(test_id, "indicator_led") == 0) {
         return run_finished_product_indicator_led(fd, test_start, test_end);
     }
+    if (strcmp(test_id, "pcba_indicator_led") == 0) {
+        return run_pcba_indicator_led(fd, test_start, test_end);
+    }
     if (strcmp(test_id, "fingerprint") == 0) return run_fingerprint(fd);
     if (strcmp(test_id, "ethernet") == 0) return run_ethernet(fd, test_start, test_end);
     if (strcmp(test_id, "wifi") == 0) return run_wifi(fd, config, test_start, test_end);
@@ -2748,6 +2934,7 @@ static int failure_code_for_test(const char *test_id)
     if (strcmp(test_id, "usb2") == 0 || strcmp(test_id, "usb2_3") == 0) return 3012;
     if (strcmp(test_id, "usb3") == 0) return 3016;
     if (strcmp(test_id, "pcba_test_points") == 0) return 3013;
+    if (strcmp(test_id, "pcba_indicator_led") == 0) return 3018;
     if (strcmp(test_id, "bluetooth") == 0) return 3005;
     if (strcmp(test_id, "battery_management") == 0) return 3014;
     if (strcmp(test_id, "typec_fast_charge") == 0 || strcmp(test_id, "fast_charge") == 0) return 3006;
