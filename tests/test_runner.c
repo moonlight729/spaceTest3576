@@ -1991,24 +1991,47 @@ static int read_ethernet_led_speed_mbps(const char *interface_name)
     return speed_mbps;
 }
 
+/*
+ * Wait until /sys/class/net/<iface>/speed reports the expected value.
+ *
+ * Forcing a speed makes the PHY renegotiate, and a loosely seated RJ45 contact
+ * can keep the link flapping for a while. Keep polling for the whole window and
+ * require <stable_samples_required> consecutive matching samples, so a single
+ * lucky read taken while the link is still coming up is not accepted as
+ * "stable" and a short flap does not abort the phase.
+ */
 static int wait_ethernet_led_speed(const char *interface_name, int expected_speed_mbps,
-                                   int timeout_ms, int *actual_speed_mbps)
+                                   int timeout_ms, int stable_samples_required,
+                                   int *actual_speed_mbps, int *stable_samples_seen)
 {
     int elapsed_ms = 0;
     int speed_mbps = -1;
+    int stable_samples = 0;
     if (timeout_ms <= 0) timeout_ms = 10000;
+    if (stable_samples_required <= 0) stable_samples_required = 1;
     while (elapsed_ms <= timeout_ms) {
         if (net_carrier_is_up(interface_name)) {
-            speed_mbps = read_ethernet_led_speed_mbps(interface_name);
-            if (speed_mbps == expected_speed_mbps) {
-                if (actual_speed_mbps != NULL) *actual_speed_mbps = speed_mbps;
-                return 0;
+            int sampled_speed_mbps = read_ethernet_led_speed_mbps(interface_name);
+            if (sampled_speed_mbps == expected_speed_mbps) {
+                speed_mbps = sampled_speed_mbps;
+                ++stable_samples;
+                if (stable_samples >= stable_samples_required) {
+                    if (actual_speed_mbps != NULL) *actual_speed_mbps = speed_mbps;
+                    if (stable_samples_seen != NULL) *stable_samples_seen = stable_samples;
+                    return 0;
+                }
+            } else {
+                speed_mbps = sampled_speed_mbps;
+                stable_samples = 0;
             }
+        } else {
+            stable_samples = 0;
         }
         sleep_ms_local(200);
         elapsed_ms += 200;
     }
     if (actual_speed_mbps != NULL) *actual_speed_mbps = speed_mbps;
+    if (stable_samples_seen != NULL) *stable_samples_seen = stable_samples;
     return -1;
 }
 
@@ -2034,13 +2057,18 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     int progress_report_interval_ms = param_int(test_start, test_end, "progressReportIntervalMs", 1000);
     int phase_ms = param_int(test_start, test_end, "phaseDurationMs", 1500);
     int settle_ms = param_int(test_start, test_end, "settleMs", 2000);
-    int speed_wait_timeout_ms = param_int(test_start, test_end, "speedWaitTimeoutMs", 3000);
+    int speed_wait_timeout_ms = param_int(test_start, test_end, "speedWaitTimeoutMs", 8000);
+    int speed_retry_count = param_int(test_start, test_end, "speedRetryCount", 2);
+    int speed_retry_interval_ms = param_int(test_start, test_end, "speedRetryIntervalMs", 1000);
+    int speed_stable_samples = param_int(test_start, test_end, "speedStableSamples", 3);
+    int carrier_stable_ms = param_int(test_start, test_end, "carrierStableMs", 1000);
     int cycle_count = param_int(test_start, test_end, "cycleCount", 1);
     int timeout_ms = param_int(test_start, test_end, "manualDecisionTimeoutMs", 15000);
     int reconnect_delay_ms = param_int(test_start, test_end, "reconnectDelayMs", 25000);
     int pre_disconnect_delay_ms = param_int(test_start, test_end, "preDisconnectDelayMs", 1000);
     int resume_after_reconnect = param_bool(test_start, test_end, "resumeAfterReconnect", 0);
     int wait_cable_elapsed_ms = 0;
+    int carrier_stable_elapsed_ms = 0;
     int disconnected = 0;
     int passed = 0;
     int resumed_after_reconnect = 0;
@@ -2055,7 +2083,13 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     if (progress_report_interval_ms <= 0) progress_report_interval_ms = 1000;
     if (phase_ms <= 0) phase_ms = 1500;
     if (settle_ms < 0) settle_ms = 0;
-    if (speed_wait_timeout_ms <= 0) speed_wait_timeout_ms = 3000;
+    if (speed_wait_timeout_ms <= 0) speed_wait_timeout_ms = 8000;
+    if (speed_retry_count <= 0) speed_retry_count = 1;
+    if (speed_retry_count > 5) speed_retry_count = 5;
+    if (speed_retry_interval_ms < 0) speed_retry_interval_ms = 0;
+    if (speed_stable_samples <= 0) speed_stable_samples = 1;
+    if (speed_stable_samples > 20) speed_stable_samples = 20;
+    if (carrier_stable_ms < 0) carrier_stable_ms = 0;
     if (cycle_count <= 0) cycle_count = 1;
     if (cycle_count > 10) cycle_count = 10;
     if (timeout_ms <= 0) timeout_ms = 15000;
@@ -2115,13 +2149,25 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
     send_report(fd, "ethernet_led", "running", 0, "Insert Ethernet cable for LED test", data);
     ethernet_led_log("wait_cable", "waiting_for_carrier");
 
-    while (wait_cable_elapsed_ms < wait_cable_timeout_ms && !net_carrier_is_up(interface_name)) {
+    /* A loosely seated RJ45 plug can report carrier for a moment and drop again.
+     * Require the carrier to stay up for carrier_stable_ms before starting the
+     * speed sequence, otherwise the forced 100M switch would run on a link that
+     * is about to flap and the speed check would fail spuriously. */
+    while (wait_cable_elapsed_ms < wait_cable_timeout_ms && carrier_stable_elapsed_ms < carrier_stable_ms) {
+        if (net_carrier_is_up(interface_name)) {
+            carrier_stable_elapsed_ms += progress_report_interval_ms;
+        } else {
+            carrier_stable_elapsed_ms = 0;
+        }
         sleep_ms_local(progress_report_interval_ms);
         wait_cable_elapsed_ms += progress_report_interval_ms;
         snprintf(data, sizeof(data),
-                 "{\"interfaceName\":\"%s\",\"phase\":\"wait_cable\",\"ethernetLinkUp\":false,"
-                 "\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":%d}",
-                 interface_name, wait_cable_timeout_ms, wait_cable_elapsed_ms);
+                 "{\"interfaceName\":\"%s\",\"phase\":\"wait_cable\",\"ethernetLinkUp\":%s,"
+                 "\"requiresCableInsert\":true,\"waitCableTimeoutMs\":%d,\"elapsedMs\":%d,"
+                 "\"carrierStableMs\":%d,\"carrierStableElapsedMs\":%d}",
+                 interface_name, carrier_stable_elapsed_ms > 0 ? "true" : "false",
+                 wait_cable_timeout_ms, wait_cable_elapsed_ms,
+                 carrier_stable_ms, carrier_stable_elapsed_ms);
         send_report(fd, "ethernet_led", "running", 0, "Waiting for Ethernet cable for LED test", data);
     }
 
@@ -2164,32 +2210,62 @@ static int run_ethernet_led(int fd, const char *test_start, const char *test_end
             const char *phase_name = gigabit ? "show_1000m" : "show_100m";
             const char *expected_led = gigabit ? led_1000m : led_100m;
             int actual_speed_mbps = -1;
+            int stable_samples_seen = 0;
+            int speed_ok = 0;
+            int attempt = 0;
             ethernet_led_log(phase_name, gigabit ? "begin expected=1000Mbps led=yellow" : "begin expected=100Mbps led=green");
 
-            if (run_ethernet_led_command(interface_name, gigabit) != 0) {
-                ethernet_led_log("fail", "ethtool_command_failed code=4812");
-                restore_ethernet_led_autoneg(interface_name);
-                snprintf(data, sizeof(data),
-                         "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"cycleIndex\":%d,\"cycleCount\":%d,"
-                         "\"expectedLed\":\"%s\",\"expectedSpeedMbps\":%d,\"failureReason\":\"ethtool_command_failed\"}",
-                         interface_name, phase_name, cycle, cycle_count, expected_led, expected_speed_mbps);
-                send_report(fd, "ethernet_led", "failed", 4812, "Unable to switch Ethernet LED speed mode", data);
-                ethernet_led_resume_code = 4812;
-                return -2;
+            /* Retry the forced speed change: with a marginal RJ45 contact the PHY
+             * often links only on the second negotiation. The control connection is
+             * already down at this point, so an extra attempt costs no session. */
+            for (attempt = 1; attempt <= speed_retry_count && speed_ok == 0; ++attempt) {
+                char attempt_detail[96];
+                if (run_ethernet_led_command(interface_name, gigabit) != 0) {
+                    snprintf(attempt_detail, sizeof(attempt_detail), "phase=%s attempt=%d/%d ethtool_failed",
+                             phase_name, attempt, speed_retry_count);
+                    ethernet_led_log("ethtool_failed", attempt_detail);
+                    if (attempt >= speed_retry_count) {
+                        ethernet_led_log("fail", "ethtool_command_failed code=4812");
+                        restore_ethernet_led_autoneg(interface_name);
+                        snprintf(data, sizeof(data),
+                                 "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"cycleIndex\":%d,\"cycleCount\":%d,"
+                                 "\"expectedLed\":\"%s\",\"expectedSpeedMbps\":%d,\"speedAttempt\":%d,"
+                                 "\"failureReason\":\"ethtool_command_failed\"}",
+                                 interface_name, phase_name, cycle, cycle_count, expected_led,
+                                 expected_speed_mbps, attempt);
+                        send_report(fd, "ethernet_led", "failed", 4812, "Unable to switch Ethernet LED speed mode", data);
+                        ethernet_led_resume_code = 4812;
+                        return -2;
+                    }
+                    sleep_ms_local(speed_retry_interval_ms);
+                    continue;
+                }
+
+                if (settle_ms > 0) sleep_ms_local(settle_ms);
+                ethernet_led_log("link_reconnect", phase_name);
+                if (wait_ethernet_led_speed(interface_name, expected_speed_mbps, speed_wait_timeout_ms,
+                                            speed_stable_samples, &actual_speed_mbps,
+                                            &stable_samples_seen) == 0) {
+                    speed_ok = 1;
+                    break;
+                }
+                snprintf(attempt_detail, sizeof(attempt_detail), "phase=%s attempt=%d/%d actual=%d stable=%d",
+                         phase_name, attempt, speed_retry_count, actual_speed_mbps, stable_samples_seen);
+                ethernet_led_log("speed_verify_retry", attempt_detail);
+                if (attempt < speed_retry_count) sleep_ms_local(speed_retry_interval_ms);
             }
 
-            if (settle_ms > 0) sleep_ms_local(settle_ms);
-            ethernet_led_log("link_reconnect", phase_name);
-            if (wait_ethernet_led_speed(interface_name, expected_speed_mbps,
-                                        speed_wait_timeout_ms, &actual_speed_mbps) != 0) {
+            if (speed_ok == 0) {
                 ethernet_led_log("fail", gigabit ? "yellow_speed_verify_failed code=4813" : "green_speed_verify_failed code=4813");
                 restore_ethernet_led_autoneg(interface_name);
                 snprintf(data, sizeof(data),
                          "{\"interfaceName\":\"%s\",\"phase\":\"%s\",\"cycleIndex\":%d,\"cycleCount\":%d,"
                          "\"expectedLed\":\"%s\",\"expectedSpeedMbps\":%d,\"actualSpeedMbps\":%d,"
+                         "\"speedAttempt\":%d,\"speedStableSamples\":%d,\"speedWaitTimeoutMs\":%d,"
                          "\"failureReason\":\"speed_verify_failed\"}",
                          interface_name, phase_name, cycle, cycle_count, expected_led,
-                         expected_speed_mbps, actual_speed_mbps);
+                         expected_speed_mbps, actual_speed_mbps, speed_retry_count,
+                         stable_samples_seen, speed_wait_timeout_ms);
                 send_report(fd, "ethernet_led", "failed", 4813, "Ethernet LED speed mode did not become stable", data);
                 ethernet_led_resume_code = 4813;
                 return -2;
